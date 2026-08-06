@@ -1,0 +1,26 @@
+name: Daily Kicker Scraper
+
+on:
+  schedule:
+    # 08:00 UTC соответствует 12:00 по времени Еревана (UTC+4)
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Позволяет запускать вручную для проверки
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверка кода репозитория
+        uses: actions/checkout@v3
+
+      - name: Настройка Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Установка библиотек
+        run: |
+          pip install -r requirements.txt
+
+      - name: Запуск скрапера
+        run: python kicker_scraper.py
