@@ -8,7 +8,7 @@ on:
 
 jobs:
   run-scraper:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Проверка кода репозитория
         uses: actions/checkout@v3
