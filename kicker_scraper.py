@@ -1,7 +1,7 @@
+import os
+import re
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
-import re
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -13,7 +13,6 @@ URL_TESTSPIELE = "https://www.kicker.de/2-bundesliga/testspiele"
 def translate_terms(text):
     if not text:
         return "Нет данных"
-    
     dict_terms = {
         r"\bunter Ausschluss der Öffentlichkeit\b": "Без зрителей (закрытый матч)",
         r"\bGeneralprobe\b": "Генеральная репетиция (финальный тест)",
@@ -24,17 +23,14 @@ def translate_terms(text):
         r"\bStadion\b": "Стадион",
         r"\bTrainingszentrum\b": "Тренировочная база"
     }
-    
     translated = text
     for de_pattern, ru_translation in dict_terms.items():
         translated = re.sub(de_pattern, ru_translation, translated, flags=re.IGNORECASE)
-        
     return translated
 
 def scrape_kicker_testspiele():
     response = requests.get(URL_TESTSPIELE, headers=HEADERS)
     if response.status_code != 200:
-        print(f"Ошибка доступа к Kicker.de: статус {response.status_code}")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -67,21 +63,48 @@ def scrape_kicker_testspiele():
             venue_comment = translate_terms(venue_comment_raw)
 
             matches_data.append({
-                "Команды": teams_str,
-                "Место проведения": venue_comment if "Стадион" in venue_comment or "Поле" in venue_comment else "См. карточку",
-                "Дата": date_str,
-                "Рабочая ссылка": match_link,
-                "Комментарии": venue_comment
+                "teams": teams_str,
+                "date": date_str,
+                "comment": venue_comment,
+                "link": match_link
             })
         except Exception:
             continue
 
     return matches_data
 
+def send_telegram_message(matches):
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("Ошибка: Секреты TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не найдены.")
+        return
+
+    message = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\n"
+    for m in matches:
+        message += f"🏆 <b>{m['teams']}</b>\n"
+        message += f"📅 Дата: {m['date']}\n"
+        message += f"ℹ️ Детали: {m['comment']}\n"
+        message += f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    resp = requests.post(url, json=payload)
+    if resp.status_code == 200:
+        print("Сообщение успешно отправлено в Telegram!")
+    else:
+        print(f"Ошибка отправки в Telegram: {resp.status_code}, {resp.text}")
+
 if __name__ == "__main__":
     data = scrape_kicker_testspiele()
-    df = pd.DataFrame(data)
-    if not df.empty:
-        print(df.to_markdown(index=False))
+    if data:
+        send_telegram_message(data)
     else:
-        print("На данный момент актуальные товарищеские матчи не найдены или структура страницы обновилась.")
+        print("Актуальные матчи не найдены.")
