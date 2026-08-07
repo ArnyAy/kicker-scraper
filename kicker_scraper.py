@@ -1,7 +1,11 @@
 import os
 import re
+import logging
 import requests
 from bs4 import BeautifulSoup
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -9,6 +13,7 @@ HEADERS = {
 }
 
 URL_TESTSPIELE = "https://www.kicker.de/2-bundesliga/testspiele"
+TIMEOUT_CONFIG = (5, 15)  # (connect timeout, read timeout)
 
 def translate_terms(text):
     if not text:
@@ -29,15 +34,22 @@ def translate_terms(text):
     return translated
 
 def scrape_kicker_testspiele():
-    response = requests.get(URL_TESTSPIELE, headers=HEADERS)
-    if response.status_code != 200:
+    logging.info("Запрос данных с kicker.de...")
+    try:
+        response = requests.get(URL_TESTSPIELE, headers=HEADERS, timeout=TIMEOUT_CONFIG)
+        if response.status_code != 200:
+            logging.error(f"Ошибка загрузки страницы Kicker: HTTP {response.status_code}")
+            return []
+    except requests.RequestException as e:
+        logging.error(f"Сетевая ошибка при запросе к Kicker: {e}")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
     matches_data = []
 
     match_rows = soup.find_all("div", class_=re.compile(r"kick__v100-gameList__gameRow|kick__matchrow"))
-    
+    logging.info(f"Найдено строк с матчами: {len(match_rows)}")
+
     for row in match_rows:
         try:
             link_tag = row.find("a", href=True)
@@ -68,43 +80,61 @@ def scrape_kicker_testspiele():
                 "comment": venue_comment,
                 "link": match_link
             })
-        except Exception:
+        except Exception as err:
+            logging.warning(f"Ошибка при обработке строки матча: {err}")
             continue
 
     return matches_data
+
+def send_telegram_payload(token, chat_id, text_message):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text_message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=TIMEOUT_CONFIG)
+        if resp.status_code == 200:
+            logging.info("Сообщение успешно доставлено в Telegram!")
+        else:
+            logging.error(f"Ошибка Telegram API: {resp.status_code}, {resp.text}")
+    except requests.RequestException as e:
+        logging.error(f"Сетевая ошибка при отправке в Telegram: {e}")
 
 def send_telegram_message(matches):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        print("Ошибка: Секреты TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не найдены.")
+        logging.error("Секреты TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не установлены!")
         return
 
-    message = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\n"
+    if not matches:
+        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\nℹ️ На сегодня товарищеских матчей не найдено."
+        send_telegram_payload(token, chat_id, empty_msg)
+        return
+
+    header = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\n"
+    current_msg = header
+
     for m in matches:
-        message += f"🏆 <b>{m['teams']}</b>\n"
-        message += f"📅 Дата: {m['date']}\n"
-        message += f"ℹ️ Детали: {m['comment']}\n"
-        message += f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
+        card = (
+            f"🏆 <b>{m['teams']}</b>\n"
+            f"📅 Дата: {m['date']}\n"
+            f"ℹ️ Детали: {m['comment']}\n"
+            f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
+        )
+        if len(current_msg) + len(card) > 3500:
+            send_telegram_payload(token, chat_id, current_msg)
+            current_msg = "⚽ <b>2. Bundesliga (продолжение):</b>\n\n" + card
+        else:
+            current_msg += card
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-
-    resp = requests.post(url, json=payload)
-    if resp.status_code == 200:
-        print("Сообщение успешно отправлено в Telegram!")
-    else:
-        print(f"Ошибка отправки в Telegram: {resp.status_code}, {resp.text}")
+    if current_msg:
+        send_telegram_payload(token, chat_id, current_msg)
 
 if __name__ == "__main__":
     data = scrape_kicker_testspiele()
-    if data:
-        send_telegram_message(data)
-    else:
-        print("Актуальные матчи не найдены.")
+    send_telegram_message(data)
