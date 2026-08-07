@@ -4,7 +4,6 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 HEADERS = {
@@ -13,42 +12,57 @@ HEADERS = {
 }
 
 URL_TESTSPIELE = "https://www.kicker.de/2-bundesliga/testspiele"
-TIMEOUT_CONFIG = (5, 15)  # (connect timeout, read timeout)
+TIMEOUT_CONFIG = (5, 15)
 
-def translate_terms(text):
+# Точный словарь терминов
+EXACT_TRANSLATIONS = {
+    "unter Ausschluss der Öffentlichkeit": ("Без зрителей (закрытый матч)", "🟢"),
+    "Generalprobe": ("Генеральная репетиция", "🟢"),
+    "abgesagt": ("ОТМЕНЕН", "🔴"),
+    "Abbruch": ("Матч прерван", "🔴"),
+    "Platz": ("Поле", "🟢"),
+    "Kunstrasenplatz": ("Искусственное поле", "🟢"),
+    "Stadion": ("Стадион", "🟢"),
+    "Trainingszentrum": ("Тренировочная база", "🟢")
+}
+
+def translate_and_flag(text):
     if not text:
-        return "Нет данных"
-    dict_terms = {
-        r"\bunter Ausschluss der Öffentlichkeit\b": "Без зрителей (закрытый матч)",
-        r"\bGeneralprobe\b": "Генеральная репетиция (финальный тест)",
-        r"\babgesagt\b": "ОТМЕНЕН",
-        r"\bAbbruch\b": "Матч прерван",
-        r"\bPlatz\b": "Поле",
-        r"\bKunstrasenplatz\b": "Искусственное поле",
-        r"\bStadion\b": "Стадион",
-        r"\bTrainingszentrum\b": "Тренировочная база"
-    }
+        return "Без комментариев", "🟢"
+    
+    flag = "🟢"
     translated = text
-    for de_pattern, ru_translation in dict_terms.items():
-        translated = re.sub(de_pattern, ru_translation, translated, flags=re.IGNORECASE)
-    return translated
+    matched = False
+
+    for de_term, (ru_term, status_flag) in EXACT_TRANSLATIONS.items():
+        if re.search(rf"\b{re.escape(de_term)}\b", translated, flags=re.IGNORECASE):
+            translated = re.sub(rf"\b{re.escape(de_term)}\b", ru_term, translated, flags=re.IGNORECASE)
+            matched = True
+            if status_flag != "🟢":
+                flag = status_flag
+
+    # Если в тексте остался немецкий текст, который не распознан точным словарем — ставим желтый флаг
+    if not matched and re.search(r'[a-zA-ZäöüÄÖÜß]', translated):
+        flag = "🟡"  # Требует внимания / неопределенный перевод
+
+    return translated, flag
 
 def scrape_kicker_testspiele():
-    logging.info("Запрос данных с kicker.de...")
+    logging.info("Запрос будущих товарищеских матчей 2. Бундеслиги с kicker.de...")
     try:
         response = requests.get(URL_TESTSPIELE, headers=HEADERS, timeout=TIMEOUT_CONFIG)
         if response.status_code != 200:
-            logging.error(f"Ошибка загрузки страницы Kicker: HTTP {response.status_code}")
+            logging.error(f"Ошибка HTTP {response.status_code}")
             return []
     except requests.RequestException as e:
-        logging.error(f"Сетевая ошибка при запросе к Kicker: {e}")
+        logging.error(f"Сетевая ошибка: {e}")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
     matches_data = []
 
     match_rows = soup.find_all("div", class_=re.compile(r"kick__v100-gameList__gameRow|kick__matchrow"))
-    logging.info(f"Найдено строк с матчами: {len(match_rows)}")
+    logging.info(f"Найдено матчей в расписании: {len(match_rows)}")
 
     for row in match_rows:
         try:
@@ -64,7 +78,7 @@ def scrape_kicker_testspiele():
                 continue
 
             date_tag = row.find_parent("div", class_=re.compile(r"kick__v100-gameList"))
-            date_str = "Дата не указана"
+            date_str = "Дата уточняется"
             if date_tag:
                 header_date = date_tag.find("div", class_=re.compile(r"kick__v100-gameList__header|kick__date"))
                 if header_date:
@@ -72,16 +86,22 @@ def scrape_kicker_testspiele():
 
             info_tag = row.find("div", class_=re.compile(r"kick__v100-gameCell__info|kick__matchrow__info"))
             venue_comment_raw = info_tag.text.strip() if info_tag else ""
-            venue_comment = translate_terms(venue_comment_raw)
+            
+            translated_comment, status_flag = translate_and_flag(venue_comment_raw)
+
+            # Проверка сомнения по дате
+            if "уточняется" in date_str or not date_str:
+                status_flag = "🟡"
 
             matches_data.append({
                 "teams": teams_str,
                 "date": date_str,
-                "comment": venue_comment,
+                "comment": translated_comment,
+                "flag": status_flag,
                 "link": match_link
             })
         except Exception as err:
-            logging.warning(f"Ошибка при обработке строки матча: {err}")
+            logging.warning(f"Ошибка строки: {err}")
             continue
 
     return matches_data
@@ -95,35 +115,31 @@ def send_telegram_payload(token, chat_id, text_message):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, json=payload, timeout=TIMEOUT_CONFIG)
-        if resp.status_code == 200:
-            logging.info("Сообщение успешно доставлено в Telegram!")
-        else:
-            logging.error(f"Ошибка Telegram API: {resp.status_code}, {resp.text}")
+        requests.post(url, json=payload, timeout=TIMEOUT_CONFIG)
     except requests.RequestException as e:
-        logging.error(f"Сетевая ошибка при отправке в Telegram: {e}")
+        logging.error(f"Ошибка отправки в Telegram: {e}")
 
 def send_telegram_message(matches):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        logging.error("Секреты TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не установлены!")
         return
 
     if not matches:
-        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\nℹ️ На сегодня товарищеских матчей не найдено."
+        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи (до конца 2027)</b>\n\nℹ️ Запланированных матчей не найдено."
         send_telegram_payload(token, chat_id, empty_msg)
         return
 
-    header = "⚽ <b>2. Bundesliga: Товарищеские матчи</b>\n\n"
+    header = "⚽ <b>2. Bundesliga: Календарь товарищеских матчей</b>\n"
+    header += "<i>Легенда: 🟢 Точно | 🟡 Есть сомнения/Неточный перевод | 🔴 Отменен</i>\n\n"
     current_msg = header
 
     for m in matches:
         card = (
-            f"🏆 <b>{m['teams']}</b>\n"
+            f"{m['flag']} <b>{m['teams']}</b>\n"
             f"📅 Дата: {m['date']}\n"
-            f"ℹ️ Детали: {m['comment']}\n"
+            f"ℹ️ Статус: {m['comment']}\n"
             f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
         )
         if len(current_msg) + len(card) > 3500:
