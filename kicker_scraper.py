@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import requests
+from datetime import datetime
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -14,7 +15,6 @@ HEADERS = {
 URL_TESTSPIELE = "https://www.kicker.de/2-bundesliga/testspiele"
 TIMEOUT_CONFIG = (5, 15)
 
-# Точный словарь терминов
 EXACT_TRANSLATIONS = {
     "unter Ausschluss der Öffentlichkeit": ("Без зрителей (закрытый матч)", "🟢"),
     "Generalprobe": ("Генеральная репетиция", "🟢"),
@@ -41,14 +41,26 @@ def translate_and_flag(text):
             if status_flag != "🟢":
                 flag = status_flag
 
-    # Если в тексте остался немецкий текст, который не распознан точным словарем — ставим желтый флаг
     if not matched and re.search(r'[a-zA-ZäöüÄÖÜß]', translated):
-        flag = "🟡"  # Требует внимания / неопределенный перевод
+        flag = "🟡"
 
     return translated, flag
 
+def is_date_in_2026(date_str):
+    """Проверка: относится ли дата к интервалу с авг 2026 по 31.12.2026"""
+    if not date_str or "уточняется" in date_str.lower():
+        return True, "🟡" # Оставляем с желтым флагом сомнения
+    
+    # Ищем года в строке даты
+    year_match = re.search(r'\b(202[4-9])\b', date_str)
+    if year_match:
+        year = int(year_match.group(1))
+        if year > 2026:
+            return False, "🟢" # Игнорируем матчи 2027+
+    return True, "🟢"
+
 def scrape_kicker_testspiele():
-    logging.info("Запрос будущих товарищеских матчей 2. Бундеслиги с kicker.de...")
+    logging.info("Запрос товарищеских матчей 2. Бундеслиги до конца 2026 года...")
     try:
         response = requests.get(URL_TESTSPIELE, headers=HEADERS, timeout=TIMEOUT_CONFIG)
         if response.status_code != 200:
@@ -84,24 +96,28 @@ def scrape_kicker_testspiele():
                 if header_date:
                     date_str = header_date.text.strip()
 
+            # Проверка соответствия периоду до конца 2026 года
+            valid_date, date_flag = is_date_in_2026(date_str)
+            if not valid_date:
+                continue
+
             info_tag = row.find("div", class_=re.compile(r"kick__v100-gameCell__info|kick__matchrow__info"))
             venue_comment_raw = info_tag.text.strip() if info_tag else ""
             
             translated_comment, status_flag = translate_and_flag(venue_comment_raw)
 
-            # Проверка сомнения по дате
-            if "уточняется" in date_str or not date_str:
-                status_flag = "🟡"
+            # Если дата вызывает сомнения, приоритет за желтым флагом
+            final_flag = date_flag if date_flag == "🟡" and status_flag == "🟢" else status_flag
 
             matches_data.append({
                 "teams": teams_str,
                 "date": date_str,
                 "comment": translated_comment,
-                "flag": status_flag,
+                "flag": final_flag,
                 "link": match_link
             })
         except Exception as err:
-            logging.warning(f"Ошибка строки: {err}")
+            logging.warning(f"Ошибка обработки строки: {err}")
             continue
 
     return matches_data
@@ -127,12 +143,12 @@ def send_telegram_message(matches):
         return
 
     if not matches:
-        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи (до конца 2027)</b>\n\nℹ️ Запланированных матчей не найдено."
+        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи (до конца 2026)</b>\n\nℹ️ Запланированных матчей до конца 2026 года не найдено."
         send_telegram_payload(token, chat_id, empty_msg)
         return
 
-    header = "⚽ <b>2. Bundesliga: Календарь товарищеских матчей</b>\n"
-    header += "<i>Легенда: 🟢 Точно | 🟡 Есть сомнения/Неточный перевод | 🔴 Отменен</i>\n\n"
+    header = "⚽ <b>2. Bundesliga: Матчи до конца 2026 года</b>\n"
+    header += "<i>Маркировка: 🟢 Точно | 🟡 Есть сомнения / Перевод | 🔴 Отменен</i>\n\n"
     current_msg = header
 
     for m in matches:
