@@ -2,9 +2,9 @@ name: Daily Kicker Scraper
 
 on:
   schedule:
-    # Запуск каждый день в 08:00 UTC (12:00 по Еревану)
+    # Ежедневный запуск в 08:00 UTC (12:00 по Еревану)
     - cron: '0 8 * * *'
-  workflow_dispatch: # Позволяет запускать вручную
+  workflow_dispatch:
 
 jobs:
   run-scraper:
