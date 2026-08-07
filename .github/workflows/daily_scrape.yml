@@ -2,7 +2,7 @@ name: Daily Kicker Scraper
 
 on:
   schedule:
-    # Ежедневный запуск в 08:00 UTC (12:00 по Еревану)
+    # Запуск каждый день в 08:00 UTC (12:00 по Еревану)
     - cron: '0 8 * * *'
   workflow_dispatch:
 
@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Проверка кода
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Настройка Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.3.0
         with:
           python-version: '3.10'
 
