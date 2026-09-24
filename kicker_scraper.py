@@ -3,166 +3,106 @@ import re
 import sys
 import logging
 import requests
-from datetime import date
-from pathlib import Path
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
+from datetime import date, datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
-}
-
-BASE_URL = "https://www.kicker.de/vereine-freundschaftsspiele/spieltag/2026-27"
-TIMEOUT_CONFIG = (5, 15)
-MAX_WEEKS = 14                  # сколько недель (Spieltag = календарная неделя) просматривать вперёд
+API_URL = "https://v3.football.api-sports.io/fixtures"
+LEAGUE_ID = 667                 # Club Friendlies (клубные товарищеские матчи)
+SEASON = 2026
 END_DATE = date(2026, 12, 31)
-DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+TIMEOUT_CONFIG = (5, 20)
 
 # Ключевые слова клубов 2. Bundesliga 2026/27.
 # ПРОВЕРЬТЕ список: здесь 17 клубов, 18-й добавьте сами.
 TEAM_KEYS = [
-    "hertha", "nürnberg", "heidenheim", "wolfsburg", "kaiserslautern",
-    "magdeburg", "cottbus", "pauli", "bochum", "hannover", "osnabrück",
-    "fürth", "braunschweig", "dresden", "karlsruhe", "darmstadt", "kiel",
+    "hertha", "nürnberg", "nurnberg", "nuremberg", "heidenheim", "wolfsburg",
+    "kaiserslautern", "magdeburg", "cottbus", "pauli", "bochum", "hannover",
+    "osnabrück", "osnabruck", "fürth", "furth", "braunschweig", "dresden",
+    "karlsruhe", "darmstadt", "kiel",
 ]
 
-EXACT_TRANSLATIONS = {
-    "unter Ausschluss der Öffentlichkeit": ("Без зрителей (закрытый матч)", "🟢"),
-    "Generalprobe": ("Генеральная репетиция", "🟢"),
-    "abgesagt": ("ОТМЕНЕН", "🔴"),
-    "Abbruch": ("Матч прерван", "🔴"),
-    "Platz": ("Поле", "🟢"),
-    "Kunstrasenplatz": ("Искусственное поле", "🟢"),
-    "Stadion": ("Стадион", "🟢"),
-    "Trainingszentrum": ("Тренировочная база", "🟢")
+# статус API -> (описание, флаг)
+STATUS_MAP = {
+    "NS": ("Запланирован", "🟢"),
+    "TBD": ("Время уточняется", "🟡"),
+    "PST": ("ОТЛОЖЕН", "🔴"),
+    "CANC": ("ОТМЕНЕН", "🔴"),
+    "ABD": ("Матч прерван", "🔴"),
+    "SUSP": ("Приостановлен", "🔴"),
+    "INT": ("Прерван", "🔴"),
 }
 
 
 class ScrapeError(Exception):
-    """Ошибка получения/разбора страницы (не путать с «матчей нет»)."""
-
-
-def translate_and_flag(text):
-    if not text:
-        return "Без комментариев", "🟢"
-
-    flag = "🟢"
-    translated = text
-    matched = False
-
-    for de_term, (ru_term, status_flag) in EXACT_TRANSLATIONS.items():
-        if re.search(rf"\b{re.escape(de_term)}\b", translated, flags=re.IGNORECASE):
-            translated = re.sub(rf"\b{re.escape(de_term)}\b", ru_term, translated, flags=re.IGNORECASE)
-            matched = True
-            if status_flag != "🟢":
-                flag = status_flag
-
-    if not matched and re.search(r'[a-zA-ZäöüÄÖÜß]', translated):
-        flag = "🟡"
-
-    return translated, flag
+    """Ошибка получения данных (не путать с «матчей нет»)."""
 
 
 def is_2bl_team(name):
     n = name.lower()
-    # пропускаем резервные и женские команды
-    if re.search(r"\b(ii|iii|u\d{2})\b", n) or "frauen" in n:
+    # пропускаем резервные, юношеские и женские команды
+    if re.search(r"\b(ii|iii|u\d{2})\b", n) or "frauen" in n or " w" == n[-2:]:
         return False
     return any(k in n for k in TEAM_KEYS)
 
 
-def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT_CONFIG)
-    logging.info("GET %s -> %s, %d байт", url, r.status_code, len(r.text))
-    # сохраняем ответ для отладки (виден как артефакт в GitHub Actions)
-    Path("debug.html").write_text(r.text, encoding="utf-8")
-    if r.status_code != 200 or len(r.text) < 5000:
-        raise ScrapeError(f"HTTP {r.status_code}, {len(r.text)} байт ({url})")
-    return r.text
-
-
-def find_next_url(soup, current):
-    """Ищет ссылку «nächster Spieltag» (следующая неделя)."""
-    for a in soup.find_all("a", href=True):
-        label = " ".join([a.get_text(" ", strip=True), a.get("title", ""), a.get("aria-label", "")])
-        if re.search(r"n(ä|ae)chster", label, re.I):
-            return urljoin(current, a["href"])
-    return None
-
-
 def scrape_kicker_testspiele():
-    logging.info("Запрос товарищеских матчей клубов 2. Бундеслиги до конца 2026 года...")
-    today = date.today()
-    matches, seen = [], set()
-    url, total_rows = BASE_URL, 0
+    api_key = os.environ.get("API_FOOTBALL_KEY")
+    if not api_key:
+        raise ScrapeError("не задан секрет API_FOOTBALL_KEY")
 
-    for week in range(MAX_WEEKS):
+    params = {
+        "league": LEAGUE_ID,
+        "season": SEASON,
+        "from": date.today().isoformat(),
+        "to": END_DATE.isoformat(),
+        "timezone": "Europe/Berlin",
+    }
+    try:
+        r = requests.get(API_URL, headers={"x-apisports-key": api_key},
+                         params=params, timeout=TIMEOUT_CONFIG)
+    except requests.RequestException as e:
+        raise ScrapeError(f"сетевая ошибка: {e}")
+
+    logging.info("GET %s -> %s, %d байт", r.url, r.status_code, len(r.text))
+    if r.status_code != 200:
+        raise ScrapeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+    payload = r.json()
+    if payload.get("errors"):
+        raise ScrapeError(f"ошибка API: {payload['errors']}")
+
+    fixtures = payload.get("response", [])
+    logging.info("Всего товарищеских матчей в периоде: %d", len(fixtures))
+
+    matches = []
+    for f in fixtures:
         try:
-            html = fetch(url)
-        except requests.RequestException as e:
-            raise ScrapeError(f"сетевая ошибка: {e}")
-
-        soup = BeautifulSoup(html, "html.parser")
-        rows = soup.find_all("div", class_=re.compile(r"gameRow|matchrow"))
-        total_rows += len(rows)
-        logging.info("Неделя %d: строк матчей на странице: %d", week, len(rows))
-        last_date = None
-
-        for row in rows:
-            try:
-                teams = row.find_all("div", class_=re.compile(r"gameCell__team|teamName"))
-                names = [t.get_text(strip=True) for t in teams if t.get_text(strip=True)]
-                if len(names) < 2:
-                    continue
-                home, away = names[0], names[1]
-                if not (is_2bl_team(home) or is_2bl_team(away)):
-                    continue
-
-                # ближайшая дата выше строки в документе
-                node = row.find_previous(string=DATE_RE)
-                m = DATE_RE.search(node) if node else None
-                d = date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
-                if d:
-                    last_date = d
-                    if not (today <= d <= END_DATE):
-                        continue
-                date_str = d.strftime("%d.%m.%Y") if d else "Дата уточняется"
-
-                key = (home, away, date_str)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                link_tag = row.find("a", href=True)
-                link = urljoin(url, link_tag["href"]) if link_tag else url
-
-                info_tag = row.find("div", class_=re.compile(r"gameCell__info|matchrow__info"))
-                comment, flag = translate_and_flag(info_tag.get_text(strip=True) if info_tag else "")
-                if d is None and flag == "🟢":
-                    flag = "🟡"
-
-                matches.append({
-                    "teams": f"{home} — {away}",
-                    "date": date_str,
-                    "comment": comment,
-                    "flag": flag,
-                    "link": link
-                })
-            except Exception as err:
-                logging.warning(f"Ошибка обработки строки: {err}")
+            home = f["teams"]["home"]["name"]
+            away = f["teams"]["away"]["name"]
+            if not (is_2bl_team(home) or is_2bl_team(away)):
                 continue
 
-        nxt = find_next_url(soup, url)
-        if not nxt or nxt == url or (last_date and last_date > END_DATE):
-            break
-        url = nxt
+            dt = datetime.fromisoformat(f["fixture"]["date"])
+            status_short = f["fixture"]["status"]["short"]
+            status_text, flag = STATUS_MAP.get(status_short, (f["fixture"]["status"]["long"], "🟡"))
 
-    if total_rows == 0:
-        raise ScrapeError("страница загрузилась, но строки матчей не распознаны "
-                          "(изменилась вёрстка или страница-заглушка/блокировка)")
+            venue = f["fixture"].get("venue") or {}
+            venue_str = ", ".join(x for x in [venue.get("name"), venue.get("city")] if x)
+            comment = status_text + (f" · {venue_str}" if venue_str else "")
+
+            matches.append({
+                "sort": dt,
+                "teams": f"{home} — {away}",
+                "date": dt.strftime("%d.%m.%Y %H:%M"),
+                "comment": comment,
+                "flag": flag,
+            })
+        except (KeyError, ValueError) as err:
+            logging.warning(f"Ошибка обработки матча: {err}")
+            continue
+
+    matches.sort(key=lambda m: m["sort"])
     return matches
 
 
@@ -193,15 +133,14 @@ def send_telegram_message(matches):
         return
 
     header = "⚽ <b>2. Bundesliga: Матчи до конца 2026 года</b>\n"
-    header += "<i>Маркировка: 🟢 Точно | 🟡 Есть сомнения / Перевод | 🔴 Отменен</i>\n\n"
+    header += "<i>Маркировка: 🟢 Запланирован | 🟡 Есть сомнения | 🔴 Отменен/отложен</i>\n\n"
     current_msg = header
 
     for m in matches:
         card = (
             f"{m['flag']} <b>{m['teams']}</b>\n"
             f"📅 Дата: {m['date']}\n"
-            f"ℹ️ Статус: {m['comment']}\n"
-            f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
+            f"ℹ️ Статус: {m['comment']}\n\n"
         )
         if len(current_msg) + len(card) > 3500:
             send_telegram_payload(token, chat_id, current_msg)
@@ -221,6 +160,6 @@ if __name__ == "__main__":
         token = os.environ.get("TELEGRAM_TOKEN")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         if token and chat_id:
-            send_telegram_payload(token, chat_id, f"⚠️ <b>Парсер Kicker не смог получить данные:</b>\n{e}")
+            send_telegram_payload(token, chat_id, f"⚠️ <b>Парсер не смог получить данные:</b>\n{e}")
         sys.exit(1)
     send_telegram_message(data)
