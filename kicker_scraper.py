@@ -1,8 +1,10 @@
 import os
 import re
+import sys
 import logging
 import requests
-from datetime import datetime
+from datetime import date
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -12,8 +14,19 @@ HEADERS = {
     "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-URL_TESTSPIELE = "https://www.kicker.de/2-bundesliga/testspiele"
+BASE_URL = "https://www.kicker.de/vereine-freundschaftsspiele/spieltag/2026-27"
 TIMEOUT_CONFIG = (5, 15)
+MAX_WEEKS = 14                  # сколько недель (Spieltag = календарная неделя) просматривать вперёд
+END_DATE = date(2026, 12, 31)
+DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+
+# Ключевые слова клубов 2. Bundesliga 2026/27.
+# ПРОВЕРЬТЕ список: здесь 17 клубов, 18-й добавьте сами.
+TEAM_KEYS = [
+    "hertha", "nürnberg", "heidenheim", "wolfsburg", "kaiserslautern",
+    "magdeburg", "cottbus", "pauli", "bochum", "hannover", "osnabrück",
+    "fürth", "braunschweig", "dresden", "karlsruhe", "darmstadt", "kiel",
+]
 
 EXACT_TRANSLATIONS = {
     "unter Ausschluss der Öffentlichkeit": ("Без зрителей (закрытый матч)", "🟢"),
@@ -26,10 +39,15 @@ EXACT_TRANSLATIONS = {
     "Trainingszentrum": ("Тренировочная база", "🟢")
 }
 
+
+class ScrapeError(Exception):
+    """Ошибка получения/разбора страницы (не путать с «матчей нет»)."""
+
+
 def translate_and_flag(text):
     if not text:
         return "Без комментариев", "🟢"
-    
+
     flag = "🟢"
     translated = text
     matched = False
@@ -46,127 +64,43 @@ def translate_and_flag(text):
 
     return translated, flag
 
-def is_date_in_2026(date_str):
-    """Проверка: относится ли дата к интервалу с авг 2026 по 31.12.2026"""
-    if not date_str or "уточняется" in date_str.lower():
-        return True, "🟡" # Оставляем с желтым флагом сомнения
-    
-    # Ищем года в строке даты
-    year_match = re.search(r'\b(202[4-9])\b', date_str)
-    if year_match:
-        year = int(year_match.group(1))
-        if year > 2026:
-            return False, "🟢" # Игнорируем матчи 2027+
-    return True, "🟢"
+
+def is_2bl_team(name):
+    n = name.lower()
+    # пропускаем резервные и женские команды
+    if re.search(r"\b(ii|iii|u\d{2})\b", n) or "frauen" in n:
+        return False
+    return any(k in n for k in TEAM_KEYS)
+
+
+def fetch(url):
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT_CONFIG)
+    logging.info("GET %s -> %s, %d байт", url, r.status_code, len(r.text))
+    if r.status_code != 200 or len(r.text) < 5000:
+        raise ScrapeError(f"HTTP {r.status_code}, {len(r.text)} байт ({url})")
+    return r.text
+
+
+def find_next_url(soup, current):
+    """Ищет ссылку «nächster Spieltag» (следующая неделя)."""
+    for a in soup.find_all("a", href=True):
+        label = " ".join([a.get_text(" ", strip=True), a.get("title", ""), a.get("aria-label", "")])
+        if re.search(r"n(ä|ae)chster", label, re.I):
+            return urljoin(current, a["href"])
+    return None
+
 
 def scrape_kicker_testspiele():
-    logging.info("Запрос товарищеских матчей 2. Бундеслиги до конца 2026 года...")
-    try:
-        response = requests.get(URL_TESTSPIELE, headers=HEADERS, timeout=TIMEOUT_CONFIG)
-        if response.status_code != 200:
-            logging.error(f"Ошибка HTTP {response.status_code}")
-            return []
-    except requests.RequestException as e:
-        logging.error(f"Сетевая ошибка: {e}")
-        return []
+    logging.info("Запрос товарищеских матчей клубов 2. Бундеслиги до конца 2026 года...")
+    today = date.today()
+    matches, seen = [], set()
+    url, total_rows = BASE_URL, 0
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    matches_data = []
-
-    match_rows = soup.find_all("div", class_=re.compile(r"kick__v100-gameList__gameRow|kick__matchrow"))
-    logging.info(f"Найдено матчей в расписании: {len(match_rows)}")
-
-    for row in match_rows:
+    for week in range(MAX_WEEKS):
         try:
-            link_tag = row.find("a", href=True)
-            match_link = f"https://www.kicker.de{link_tag['href']}" if link_tag else URL_TESTSPIELE
-            
-            teams = row.find_all("div", class_=re.compile(r"kick__v100-gameCell__team|kick__matchrow__teamName"))
-            if len(teams) >= 2:
-                team_home = teams[0].text.strip()
-                team_away = teams[1].text.strip()
-                teams_str = f"{team_home} — {team_away}"
-            else:
-                continue
+            html = fetch(url)
+        except requests.RequestException as e:
+            raise ScrapeError(f"сетевая ошибка: {e}")
 
-            date_tag = row.find_parent("div", class_=re.compile(r"kick__v100-gameList"))
-            date_str = "Дата уточняется"
-            if date_tag:
-                header_date = date_tag.find("div", class_=re.compile(r"kick__v100-gameList__header|kick__date"))
-                if header_date:
-                    date_str = header_date.text.strip()
-
-            # Проверка соответствия периоду до конца 2026 года
-            valid_date, date_flag = is_date_in_2026(date_str)
-            if not valid_date:
-                continue
-
-            info_tag = row.find("div", class_=re.compile(r"kick__v100-gameCell__info|kick__matchrow__info"))
-            venue_comment_raw = info_tag.text.strip() if info_tag else ""
-            
-            translated_comment, status_flag = translate_and_flag(venue_comment_raw)
-
-            # Если дата вызывает сомнения, приоритет за желтым флагом
-            final_flag = date_flag if date_flag == "🟡" and status_flag == "🟢" else status_flag
-
-            matches_data.append({
-                "teams": teams_str,
-                "date": date_str,
-                "comment": translated_comment,
-                "flag": final_flag,
-                "link": match_link
-            })
-        except Exception as err:
-            logging.warning(f"Ошибка обработки строки: {err}")
-            continue
-
-    return matches_data
-
-def send_telegram_payload(token, chat_id, text_message):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text_message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, json=payload, timeout=TIMEOUT_CONFIG)
-    except requests.RequestException as e:
-        logging.error(f"Ошибка отправки в Telegram: {e}")
-
-def send_telegram_message(matches):
-    token = os.environ.get("TELEGRAM_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-        return
-
-    if not matches:
-        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи (до конца 2026)</b>\n\nℹ️ Запланированных матчей до конца 2026 года не найдено."
-        send_telegram_payload(token, chat_id, empty_msg)
-        return
-
-    header = "⚽ <b>2. Bundesliga: Матчи до конца 2026 года</b>\n"
-    header += "<i>Маркировка: 🟢 Точно | 🟡 Есть сомнения / Перевод | 🔴 Отменен</i>\n\n"
-    current_msg = header
-
-    for m in matches:
-        card = (
-            f"{m['flag']} <b>{m['teams']}</b>\n"
-            f"📅 Дата: {m['date']}\n"
-            f"ℹ️ Статус: {m['comment']}\n"
-            f"🔗 <a href='{m['link']}'>Ссылка на Kicker</a>\n\n"
-        )
-        if len(current_msg) + len(card) > 3500:
-            send_telegram_payload(token, chat_id, current_msg)
-            current_msg = "⚽ <b>2. Bundesliga (продолжение):</b>\n\n" + card
-        else:
-            current_msg += card
-
-    if current_msg:
-        send_telegram_payload(token, chat_id, current_msg)
-
-if __name__ == "__main__":
-    data = scrape_kicker_testspiele()
-    send_telegram_message(data)
+        if week == 0:
+            with open("debug.html", "w", encoding="utf-8") as
