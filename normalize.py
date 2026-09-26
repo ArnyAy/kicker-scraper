@@ -1,15 +1,16 @@
-import html, re
+import html
+import re
 
 # Лексикон: признак НЕ первой команды / не товарищеского матча
 SKIP_TOKENS = ("u17", "u19", "u21", "u23", " ii", "frauen", "women",
                "legenden", "traditionself", "allstars", "junioren", "a-junioren")
 
-# Лексикон статусов (kicker / weltfussball)
+# Лексикон статусов (kicker / weltfussball) — для будущих шагов
 STATUS_WORDS = {"ende": "finished", "live": "live", "abgesagt": "cancelled",
                 "verlegt": "postponed", "ausgefallen": "cancelled",
                 "n.v.": "finished", "i.e.": "finished"}
 
-# Сокращения → официальные имена (единый вид для всех источников)
+# Сокращения -> официальные имена (единый вид для всех источников)
 ABBR = {
     "k'lautern": "1. FC Kaiserslautern", "kaiserslautern": "1. FC Kaiserslautern",
     "gr furth": "SpVgg Greuther Fürth", "furth": "SpVgg Greuther Fürth",
