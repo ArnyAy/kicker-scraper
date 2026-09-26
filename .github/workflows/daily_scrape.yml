@@ -1,7 +1,7 @@
 name: Daily Scrape
 on:
   schedule:
-    - cron: "0 6 * * *"   # 08:00 Berlin
+    - cron: "0 6 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -10,9 +10,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
+        with:
+          python-version: "3.12"
       - run: pip install -r requirements.txt
+      - name: Restore DB
+        uses: actions/cache@v4
+        with:
+          path: matches.db
+          key: matches-db-${{ github.run_id }}
+          restore-keys: |
+            matches-db-
       - run: python kicker_scraper.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Save DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: matches.db
+          key: matches-db-${{ github.run_id }}
