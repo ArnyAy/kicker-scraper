@@ -1,165 +1,161 @@
 import os
 import re
-import sys
+import sqlite3
 import logging
 import requests
 from datetime import date, datetime
+from bs4 import BeautifulSoup
+from clubs import CLUBS, friendlies_url
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-API_URL = "https://v3.football.api-sports.io/fixtures"
-LEAGUE_ID = 667                 # Club Friendlies (клубные товарищеские матчи)
-SEASON = 2026
-END_DATE = date(2026, 12, 31)
-TIMEOUT_CONFIG = (5, 20)
-
-# Ключевые слова клубов 2. Bundesliga 2026/27.
-# ПРОВЕРЬТЕ список: здесь 17 клубов, 18-й добавьте сами.
-TEAM_KEYS = [
-    "hertha", "nürnberg", "nurnberg", "nuremberg", "heidenheim", "wolfsburg",
-    "kaiserslautern", "magdeburg", "cottbus", "pauli", "bochum", "hannover",
-    "osnabrück", "osnabruck", "fürth", "furth", "braunschweig", "dresden",
-    "karlsruhe", "darmstadt", "kiel",
-]
-
-# статус API -> (описание, флаг)
-STATUS_MAP = {
-    "NS": ("Запланирован", "🟢"),
-    "TBD": ("Время уточняется", "🟡"),
-    "PST": ("ОТЛОЖЕН", "🔴"),
-    "CANC": ("ОТМЕНЕН", "🔴"),
-    "ABD": ("Матч прерван", "🔴"),
-    "SUSP": ("Приостановлен", "🔴"),
-    "INT": ("Прерван", "🔴"),
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language": "de-DE,de;q=0.9",
 }
+DB_PATH = "matches.db"
 
+# ---------- DB ----------
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            hash TEXT PRIMARY KEY,
+            date TEXT, time TEXT, home TEXT, away TEXT,
+            venue TEXT, source TEXT, url TEXT, sent INTEGER DEFAULT 0
+        )
+    """)
+    con.commit()
+    return con
 
-class ScrapeError(Exception):
-    """Ошибка получения данных (не путать с «матчей нет»)."""
+def match_hash(m: dict) -> str:
+    raw = f"{m['date']}|{m['home']}|{m['away']}".lower()
+    import hashlib
+    return hashlib.sha1(raw.encode()).hexdigest()
 
-
-def is_2bl_team(name):
-    n = name.lower()
-    # пропускаем резервные, юношеские и женские команды
-    if re.search(r"\b(ii|iii|u\d{2})\b", n) or "frauen" in n or " w" == n[-2:]:
-        return False
-    return any(k in n for k in TEAM_KEYS)
-
-
-def scrape_kicker_testspiele():
-    api_key = os.environ.get("API_FOOTBALL_KEY")
-    if not api_key:
-        raise ScrapeError("не задан секрет API_FOOTBALL_KEY")
-
-    params = {
-        "league": LEAGUE_ID,
-        "season": SEASON,
-        "from": date.today().isoformat(),
-        "to": END_DATE.isoformat(),
-        "timezone": "Europe/Berlin",
-    }
+# ---------- Parser ----------
+def parse_tm_date(s: str) -> date | None:
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    if not m: return None
     try:
-        r = requests.get(API_URL, headers={"x-apisports-key": api_key},
-                         params=params, timeout=TIMEOUT_CONFIG)
-    except requests.RequestException as e:
-        raise ScrapeError(f"сетевая ошибка: {e}")
+        return date(int(m[3]), int(m[2]), int(m[1]))
+    except ValueError:
+        return None
 
-    logging.info("GET %s -> %s, %d байт", r.url, r.status_code, len(r.text))
-    if r.status_code != 200:
-        raise ScrapeError(f"HTTP {r.status_code}: {r.text[:200]}")
+def scrape_club(club: dict, today: date) -> list[dict]:
+    url = friendlies_url(club["id"])
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    out = []
 
-    payload = r.json()
-    if payload.get("errors"):
-        raise ScrapeError(f"ошибка API: {payload['errors']}")
-
-    fixtures = payload.get("response", [])
-    logging.info("Всего товарищеских матчей в периоде: %d", len(fixtures))
-
-    matches = []
-    for f in fixtures:
+    # Transfermarkt: таблица тестшпилей
+    for row in soup.select("table.items tbody tr"):
+        cells = row.find_all("td")
+        if len(cells) < 5: continue
         try:
-            home = f["teams"]["home"]["name"]
-            away = f["teams"]["away"]["name"]
-            if not (is_2bl_team(home) or is_2bl_team(away)):
-                continue
-
-            dt = datetime.fromisoformat(f["fixture"]["date"])
-            status_short = f["fixture"]["status"]["short"]
-            status_text, flag = STATUS_MAP.get(status_short, (f["fixture"]["status"]["long"], "🟡"))
-
-            venue = f["fixture"].get("venue") or {}
-            venue_str = ", ".join(x for x in [venue.get("name"), venue.get("city")] if x)
-            comment = status_text + (f" · {venue_str}" if venue_str else "")
-
-            matches.append({
-                "sort": dt,
-                "teams": f"{home} — {away}",
-                "date": dt.strftime("%d.%m.%Y %H:%M"),
-                "comment": comment,
-                "flag": flag,
+            d = parse_tm_date(cells[0].get_text(" ", strip=True))
+            if not d or d < today: continue
+            
+            home_a = cells[2].find("a")
+            away_a = cells[4].find("a")
+            home = home_a.get_text(strip=True) if home_a else cells[2].get_text(strip=True)
+            away = away_a.get_text(strip=True) if away_a else cells[4].get_text(strip=True)
+            
+            # Время (если есть)
+            time_cell = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+            time_str = time_cell if re.match(r"\d{1,2}:\d{2}", time_cell) else ""
+            
+            out.append({
+                "date": d.isoformat(),
+                "time": time_str,
+                "home": home,
+                "away": away,
+                "venue": "",
+                "source": club["name"],
+                "url": url,
             })
-        except (KeyError, ValueError) as err:
-            logging.warning(f"Ошибка обработки матча: {err}")
-            continue
+        except Exception as e:
+            logging.debug(f"skip row {club['name']}: {e}")
+    return out
 
-    matches.sort(key=lambda m: m["sort"])
-    return matches
+def scrape_all() -> list[dict]:
+    today = date.today()
+    seen, all_matches = set(), []
+    for club in CLUBS:
+        try:
+            for m in scrape_club(club, today):
+                h = match_hash(m)
+                if h not in seen:
+                    seen.add(h)
+                    m["hash"] = h
+                    all_matches.append(m)
+            logging.info(f"✓ {club['name']}")
+        except Exception as e:
+            logging.error(f"✗ {club['name']}: {e}")
+    return all_matches
 
-
-def send_telegram_payload(token, chat_id, text_message):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text_message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, json=payload, timeout=TIMEOUT_CONFIG)
-    except requests.RequestException as e:
-        logging.error(f"Ошибка отправки в Telegram: {e}")
-
-
-def send_telegram_message(matches):
+# ---------- Telegram ----------
+def send_telegram(text: str):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
     if not token or not chat_id:
+        logging.error("No TELEGRAM_TOKEN/CHAT_ID")
         return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # Режем по 4000 символов
+    for i in range(0, len(text), 4000):
+        chunk = text[i:i+4000]
+        requests.post(url, json={
+            "chat_id": chat_id, "text": chunk,
+            "parse_mode": "HTML", "disable_web_page_preview": True
+        }, timeout=15)
 
+def format_message(matches: list[dict]) -> str:
     if not matches:
-        empty_msg = "⚽ <b>2. Bundesliga: Товарищеские матчи (до конца 2026)</b>\n\nℹ️ Запланированных матчей до конца 2026 года не найдено."
-        send_telegram_payload(token, chat_id, empty_msg)
-        return
-
-    header = "⚽ <b>2. Bundesliga: Матчи до конца 2026 года</b>\n"
-    header += "<i>Маркировка: 🟢 Запланирован | 🟡 Есть сомнения | 🔴 Отменен/отложен</i>\n\n"
-    current_msg = header
-
-    for m in matches:
-        card = (
-            f"{m['flag']} <b>{m['teams']}</b>\n"
-            f"📅 Дата: {m['date']}\n"
-            f"ℹ️ Статус: {m['comment']}\n\n"
+        return "⚽ <b>2. Bundesliga Testspiele</b>\n\nНет новых матчей."
+    
+    lines = ["⚽ <b>2. Bundesliga: новые товарищеские матчи</b>\n"]
+    for m in sorted(matches, key=lambda x: x["date"]):
+        t = f" {m['time']}" if m["time"] else ""
+        lines.append(
+            f"📅 {m['date']}{t}\n"
+            f"<b>{m['home']}</b> — <b>{m['away']}</b>\n"
+            f"🔗 <a href=\"{m['url']}\">{m['source']}</a>\n"
         )
-        if len(current_msg) + len(card) > 3500:
-            send_telegram_payload(token, chat_id, current_msg)
-            current_msg = "⚽ <b>2. Bundesliga (продолжение):</b>\n\n" + card
-        else:
-            current_msg += card
+    return "\n".join(lines)
 
-    if current_msg:
-        send_telegram_payload(token, chat_id, current_msg)
-
-
+# ---------- Main ----------
 if __name__ == "__main__":
-    try:
-        data = scrape_kicker_testspiele()
-    except ScrapeError as e:
-        logging.error(e)
-        token = os.environ.get("TELEGRAM_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if token and chat_id:
-            send_telegram_payload(token, chat_id, f"⚠️ <b>Парсер не смог получить данные:</b>\n{e}")
-        sys.exit(1)
-    send_telegram_message(data)
+    con = init_db()
+    matches = scrape_all()
+    logging.info(f"Найдено матчей: {len(matches)}")
+    
+    new_matches = []
+    for m in matches:
+        cur = con.execute("SELECT sent FROM matches WHERE hash=?", (m["hash"],))
+        row = cur.fetchone()
+        if not row:
+            con.execute(
+                "INSERT INTO matches VALUES (?,?,?,?,?,?,?,0)",
+                (m["hash"], m["date"], m["time"], m["home"], m["away"],
+                 m["venue"], m["source"], m["url"])
+            )
+            new_matches.append(m)
+        elif row[0] == 0:
+            new_matches.append(m)
+    
+    con.commit()
+    
+    if new_matches:
+        msg = format_message(new_matches)
+        send_telegram(msg)
+        for m in new_matches:
+            con.execute("UPDATE matches SET sent=1 WHERE hash=?", (m["hash"],))
+        con.commit()
+        logging.info(f"Отправлено: {len(new_matches)}")
+    else:
+        logging.info("Новых матчей нет")
+    
+    con.close()
