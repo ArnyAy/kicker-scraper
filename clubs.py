@@ -1,25 +1,29 @@
-# Клубы 2. Bundesliga 2026/27. ID — из URL transfermarkt.de (например /verein/166 = Hertha)
-# ВАЖНО: проверь состав в мае 2026 (после вылетов/повышений).
+from datetime import date
+
+# 2. Bundesliga 2026/27: ID + slug с weltfussball.de
+# Формат URL: https://www.weltfussball.de/teams/{id}/{slug}/2027/2/
 CLUBS = [
-    {"id": "166",  "name": "Hertha BSC",            "slug": "hertha-bsc"},
-    {"id": "131",  "name": "Hannover 96",           "slug": "hannover-96"},
-    {"id": "2158", "name": "1. FC Kaiserslautern",  "slug": "1-fc-kaiserslautern"},
-    {"id": "2110", "name": "1. FC Magdeburg",       "slug": "1-fc-magdeburg"},
-    {"id": "60",   "name": "1. FC Nürnberg",        "slug": "1-fc-nurnberg"},
-    {"id": "318",  "name": "Karlsruher SC",         "slug": "karlsruher-sc"},
-    {"id": "610",  "name": "SV Darmstadt 98",       "slug": "sv-darmstadt-98"},
-    {"id": "35",   "name": "Dynamo Dresden",        "slug": "dynamo-dresden"},
-    {"id": "136",  "name": "Greuther Fürth",        "slug": "spvgg-greuther-furth"},
-    {"id": "95",   "name": "FC Schalke 04",         "slug": "fc-schalke-04"},
-    {"id": "1314", "name": "SC Paderborn 07",       "slug": "sc-paderborn-07"},
-    {"id": "22",   "name": "VfL Bochum",            "slug": "vfl-bochum"},
-    {"id": "1386", "name": "Fortuna Düsseldorf",    "slug": "fortuna-dusseldorf"},
-    {"id": "2036", "name": "Holstein Kiel",         "slug": "holstein-kiel"},
-    {"id": "105",  "name": "Eintracht Braunschweig","slug": "eintracht-braunschweig"},
-    {"id": "717",  "name": "SV Elversberg",         "slug": "sv-elversberg"},
-    {"id": "1257", "name": "Preußen Münster",       "slug": "sc-preussen-06-munster"},
-    {"id": "33",   "name": "SSV Ulm 1846",          "slug": "ssv-ulm-1846-fussball"},
+    {"id": "te977",   "slug": "hertha-bsc",              "name": "Hertha BSC"},
+    {"id": "te951",   "slug": "hannover-96",             "name": "Hannover 96"},
+    {"id": "te6",     "slug": "1-fc-kaiserslautern",     "name": "1. FC Kaiserslautern"},
+    {"id": "te11",    "slug": "1-fc-magdeburg",          "name": "1. FC Magdeburg"},
+    {"id": "te12",    "slug": "1-fc-nuernberg",          "name": "1. FC Nürnberg"},
+    {"id": "te1109",  "slug": "karlsruher-sc",           "name": "Karlsruher SC"},
+    {"id": "te1852",  "slug": "sv-darmstadt-98",         "name": "SV Darmstadt 98"},
+    {"id": "te515",   "slug": "dynamo-dresden",          "name": "Dynamo Dresden"},
+    {"id": "te1787",  "slug": "spvgg-greuther-fuerth",   "name": "SpVgg Greuther Fürth"},
+    {"id": "te694",   "slug": "fc-schalke-04",           "name": "FC Schalke 04"},
+    {"id": "te1651",  "slug": "sc-paderborn-07",         "name": "SC Paderborn 07"},
+    {"id": "te2079",  "slug": "vfl-bochum",              "name": "VfL Bochum"},
+    {"id": "te826",   "slug": "fortuna-duesseldorf",     "name": "Fortuna Düsseldorf"},
+    {"id": "te995",   "slug": "holstein-kiel",           "name": "Holstein Kiel"},
+    {"id": "te528",   "slug": "eintracht-braunschweig",  "name": "Eintracht Braunschweig"},
+    {"id": "te13214", "slug": "sv-07-elversberg",        "name": "SV 07 Elversberg"},
+    {"id": "te1498",  "slug": "preussen-muenster",       "name": "Preußen Münster"},
+    {"id": "te1798",  "slug": "ssv-ulm-1846",            "name": "SSV Ulm 1846"},
 ]
 
-def friendlies_url(club_id: str, season: str = "2026") -> str:
-    return f"https://www.transfermarkt.de/verein/testspiele/verein/{club_id}/saison_id/{season}"
+END_DATE = date(2026, 12, 31)
+
+def schedule_url(club: dict) -> str:
+    return f"https://www.weltfussball.de/teams/{club['id']}/{club['slug']}/2027/2/"
