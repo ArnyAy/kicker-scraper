@@ -201,7 +201,7 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: API-Football (структурный, free 100 req/day) ----------
+# ---------- Источник 3: API-Football (FIXED: поиск по имени) ----------
 def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
@@ -211,22 +211,27 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     teams = cache.get("af_teams")
     if not teams:
         try:
-            r = requests.get(f"{AF_BASE}/teams",
-                             params={"league": 79, "season": 2026},
-                             headers=H, timeout=25)
-            if r.status_code != 200:
-                logging.error("API-FOOTBALL teams HTTP %s: %s", r.status_code, r.text[:200])
-                return []
             teams = {}
-            for t in r.json().get("response", []):
-                nm = (t.get("team") or {}).get("name", "")
-                tid = (t.get("team") or {}).get("id")
-                if nm and tid:
-                    teams[norm_key(nm)] = tid
+            for club in CLUBS:
+                r = requests.get(f"{AF_BASE}/teams",
+                                 params={"search": club["name"]},
+                                 headers=H, timeout=25)
+                if r.status_code != 200:
+                    logging.error("API-FOOTBALL search %s HTTP %s", club["name"], r.status_code)
+                    continue
+                for t in r.json().get("response", []):
+                    nm = (t.get("team") or {}).get("name", "")
+                    tid = (t.get("team") or {}).get("id")
+                    country = (t.get("team") or {}).get("country", "")
+                    if nm and tid and country.lower() == "germany":
+                        teams[norm_key(nm)] = tid
+                        break
+                time.sleep(0.4)
             if not teams:
-                logging.error("API-FOOTBALL: пустой список команд")
+                logging.error("API-FOOTBALL: не найдено ни одной команды")
                 return []
             cache["af_teams"] = teams
+            logging.info("API-FOOTBALL: найдено %d команд", len(teams))
         except Exception as e:
             logging.error("API-FOOTBALL teams: %s", e)
             return []
@@ -274,7 +279,7 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
                     "source": "api-football",
                     "url": "https://www.api-football.com",
                 })
-            time.sleep(0.4)  # бережём лимит 10 req/min
+            time.sleep(0.4)
         except Exception as e:
             logging.error("API-FOOTBALL %s: %s", club["name"], e)
     logging.info("API-FOOTBALL: %d Testspiele", len(out))
@@ -346,8 +351,13 @@ def scrape_gemini(today: date, cache: dict):
 # ---------- Источник 5: LLM2 = Qwen (OpenRouter free) / fallback DeepSeek ----------
 def llm2_config():
     key = os.environ.get("LLM2_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-    base = os.environ.get("LLM2_BASE_URL", "https://openrouter.ai/api/v1")
-    model = os.environ.get("LLM2_MODEL", "qwen/qwen3-235b-a22b:free")
+    base = os.environ.get("LLM2_BASE_URL")
+    # Пустая строка считаем отсутствием — подставляем дефолт
+    if not base or not base.strip():
+        base = "https://openrouter.ai/api/v1"
+    model = os.environ.get("LLM2_MODEL")
+    if not model or not model.strip():
+        model = "qwen/qwen3-235b-a22b:free"
     if key:
         return base, key, model
     dk = os.environ.get("DEEPSEEK_API_KEY")
@@ -364,7 +374,7 @@ def scrape_llm2(today: date, cache: dict):
     if not key:
         logging.info("LLM2: нет ключа -> недоступен")
         return None
-    logging.info("LLM2: модель %s", model)
+    logging.info("LLM2: base=%s model=%s", base, model)
     clubs = ", ".join(c["name"] for c in CLUBS)
     hits = web_search(
         f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 {clubs}"
