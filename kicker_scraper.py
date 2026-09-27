@@ -1,12 +1,14 @@
 import os
 import re
 import json
+import time
 import sqlite3
 import logging
 import hashlib
 import html
 import requests
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from clubs import CLUBS, schedule_url, END_DATE
 from normalize import expand_club, is_first_team_friendly, norm_key
@@ -24,14 +26,14 @@ CACHE_PATH = "llm_cache.json"
 S = requests.Session()
 S.headers.update(HEADERS)
 
+BERLIN = ZoneInfo("Europe/Berlin")
 OUR_KEYS = {norm_key(c["name"]) for c in CLUBS}
 KICKER_ENABLED = True
 
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+AF_BASE = "https://v3.football.api-sports.io"
 
 # ---------- DB ----------
 def init_db():
@@ -64,7 +66,7 @@ def url_relevant(url: str, home: str, away: str) -> bool:
         logging.info("URL check fail %s: %s", url, e)
         return False
 
-# ---------- Кэш LLM на сутки ----------
+# ---------- Кэш ----------
 def load_cache():
     if os.path.exists(CACHE_PATH):
         try:
@@ -139,11 +141,8 @@ def scrape_club(club: dict, today: date) -> list[dict]:
         out.append({
             "date": d.isoformat(),
             "time": m.group(6),
-            "home": home,
-            "away": away,
-            "venue": "",
-            "source": "weltfussball",
-            "url": url,
+            "home": home, "away": away,
+            "venue": "", "source": "weltfussball", "url": url,
         })
     return out
 
@@ -202,7 +201,86 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: Gemini (None = недоступен) ----------
+# ---------- Источник 3: API-Football (структурный, free 100 req/day) ----------
+def scrape_apifootball(today: date, cache: dict) -> list[dict]:
+    key = os.environ.get("API_FOOTBALL_KEY")
+    if not key:
+        logging.info("API-FOOTBALL: нет ключа")
+        return []
+    H = {"x-apisports-key": key}
+    teams = cache.get("af_teams")
+    if not teams:
+        try:
+            r = requests.get(f"{AF_BASE}/teams",
+                             params={"league": 79, "season": 2026},
+                             headers=H, timeout=25)
+            if r.status_code != 200:
+                logging.error("API-FOOTBALL teams HTTP %s: %s", r.status_code, r.text[:200])
+                return []
+            teams = {}
+            for t in r.json().get("response", []):
+                nm = (t.get("team") or {}).get("name", "")
+                tid = (t.get("team") or {}).get("id")
+                if nm and tid:
+                    teams[norm_key(nm)] = tid
+            if not teams:
+                logging.error("API-FOOTBALL: пустой список команд")
+                return []
+            cache["af_teams"] = teams
+        except Exception as e:
+            logging.error("API-FOOTBALL teams: %s", e)
+            return []
+    out = []
+    for club in CLUBS:
+        tid = teams.get(norm_key(club["name"]))
+        if not tid:
+            logging.info("API-FOOTBALL: нет ID для %s", club["name"])
+            continue
+        try:
+            r = requests.get(f"{AF_BASE}/fixtures",
+                             params={"team": tid, "season": 2026,
+                                     "from": today.isoformat(), "to": END_DATE.isoformat()},
+                             headers=H, timeout=25)
+            if r.status_code != 200:
+                logging.error("API-FOOTBALL fixtures %s HTTP %s", club["name"], r.status_code)
+                continue
+            for f in r.json().get("response", []):
+                league = ((f.get("league") or {}).get("name") or "").lower()
+                if "friend" not in league:
+                    continue
+                fx = f.get("fixture") or {}
+                dt_raw = fx.get("date", "")
+                if not dt_raw:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00")).astimezone(BERLIN)
+                except Exception:
+                    continue
+                if dt.date() < today or dt.date() > END_DATE:
+                    continue
+                th = (f.get("teams") or {}).get("home") or {}
+                ta = (f.get("teams") or {}).get("away") or {}
+                home = expand_club(th.get("name", ""))
+                away = expand_club(ta.get("name", ""))
+                if not is_first_team_friendly(home, away):
+                    continue
+                if not involves_our_club(home, away):
+                    continue
+                out.append({
+                    "date": dt.date().isoformat(),
+                    "time": dt.strftime("%H:%M"),
+                    "home": home, "away": away,
+                    "venue": ((fx.get("venue") or {}).get("name") or ""),
+                    "source": "api-football",
+                    "url": "https://www.api-football.com",
+                })
+            time.sleep(0.4)  # бережём лимит 10 req/min
+        except Exception as e:
+            logging.error("API-FOOTBALL %s: %s", club["name"], e)
+    logging.info("API-FOOTBALL: %d Testspiele", len(out))
+    return out
+
+# ---------- Источник 4: Gemini (None = недоступен) ----------
 def scrape_gemini(today: date, cache: dict):
     ck = cache_key_for_day(today, "gemini")
     if ck in cache:
@@ -265,22 +343,34 @@ def scrape_gemini(today: date, cache: dict):
     cache[ck] = rows
     return rows
 
-# ---------- Источник 4: поиск + DeepSeek (None = недоступен) ----------
-def scrape_deepseek(today: date, cache: dict):
-    ck = cache_key_for_day(today, "deepseek")
+# ---------- Источник 5: LLM2 = Qwen (OpenRouter free) / fallback DeepSeek ----------
+def llm2_config():
+    key = os.environ.get("LLM2_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    base = os.environ.get("LLM2_BASE_URL", "https://openrouter.ai/api/v1")
+    model = os.environ.get("LLM2_MODEL", "qwen/qwen3-235b-a22b:free")
+    if key:
+        return base, key, model
+    dk = os.environ.get("DEEPSEEK_API_KEY")
+    if dk:
+        return "https://api.deepseek.com/v1", dk, "deepseek-chat"
+    return None, None, None
+
+def scrape_llm2(today: date, cache: dict):
+    ck = cache_key_for_day(today, "llm2")
     if ck in cache:
-        logging.info("DEEPSEEK: кэш (%d)", len(cache[ck]))
+        logging.info("LLM2: кэш (%d)", len(cache[ck]))
         return cache[ck]
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    base, key, model = llm2_config()
     if not key:
-        logging.info("DEEPSEEK: нет ключа -> недоступен")
+        logging.info("LLM2: нет ключа -> недоступен")
         return None
+    logging.info("LLM2: модель %s", model)
     clubs = ", ".join(c["name"] for c in CLUBS)
     hits = web_search(
         f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 {clubs}"
     )
     if not hits:
-        logging.info("DEEPSEEK: поиск вернул 0")
+        logging.info("LLM2: поиск вернул 0")
         return []
     urls_text = "\n".join(f"- {h['title']} | {h['url']} | {h['snippet']}" for h in hits[:8])
     prompt = (
@@ -294,34 +384,36 @@ def scrape_deepseek(today: date, cache: dict):
         f"No markdown. If nothing confirmed, reply [].\n"
     )
     body = {
-        "model": DEEPSEEK_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "response_format": {"type": "json_object"},
     }
     try:
-        r = requests.post(DEEPSEEK_URL,
+        r = requests.post(f"{base}/chat/completions",
                           headers={"Authorization": f"Bearer {key}",
                                    "Content-Type": "application/json"},
                           json=body, timeout=(15, 120))
     except Exception as e:
-        logging.error("DEEPSEEK network: %s -> недоступен", e)
+        logging.error("LLM2 network: %s -> недоступен", e)
         return None
     if r.status_code != 200:
-        logging.error("DEEPSEEK HTTP %s: %s -> недоступен", r.status_code, r.text[:200])
+        logging.error("LLM2 HTTP %s: %s -> недоступен", r.status_code, r.text[:200])
         return None
     try:
         content = r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error("DEEPSEEK parse: %s -> недоступен", e)
+        logging.error("LLM2 parse: %s -> недоступен", e)
         return None
+    if content.startswith("```"):
+        content = re.sub(r"^```[a-z]*\n?", "", content)
+        content = re.sub(r"\n?```$", "", content)
     try:
         rows = json.loads(content)
     except Exception:
         rows = []
     if not isinstance(rows, list):
         rows = []
-    logging.info("DEEPSEEK: кандидатов %d", len(rows))
+    logging.info("LLM2: кандидатов %d", len(rows))
     cache[ck] = rows
     return rows
 
@@ -364,6 +456,18 @@ def scrape_all() -> list[dict]:
     cache = load_cache()
 
     structural = {}
+
+    def add(ms):
+        for m in ms:
+            h = match_hash(m)
+            m["hash"] = h
+            structural.setdefault(h, m)
+
+    try:
+        add(scrape_apifootball(today, cache))
+    except Exception as e:
+        logging.error("AF aggregate: %s", e)
+
     for club in CLUBS:
         ms = []
         try:
@@ -375,31 +479,28 @@ def scrape_all() -> list[dict]:
         except Exception as e:
             logging.error("KICKER %s: %s", club["name"], e)
         logging.info("✓ %s: %d Testspiele", club["name"], len(ms))
-        for m in ms:
-            h = match_hash(m)
-            m["hash"] = h
-            structural[h] = m
+        add(ms)
 
     g = scrape_gemini(today, cache)
-    d = scrape_deepseek(today, cache)
-    g_un, d_un = (g is None), (d is None)
+    l2 = scrape_llm2(today, cache)
+    g_un, l2_un = (g is None), (l2 is None)
     gv = validate_llm_rows(g or [], "Gemini")
-    dv = validate_llm_rows(d or [], "DeepSeek")
+    lv = validate_llm_rows(l2 or [], "LLM2")
     save_cache(cache)
 
     confirmed = {}
-    if g_un and d_un:
+    if g_un and l2_un:
         logging.info("Голосование: оба LLM недоступны, только структурные")
     elif g_un:
-        logging.info("Голосование: Gemini недоступен, доверяем валидированному DeepSeek")
-        confirmed = {match_hash(m): m for m in dv}
-    elif d_un:
-        logging.info("Голосование: DeepSeek недоступен, доверяем валидированному Gemini")
+        logging.info("Голосование: Gemini недоступен, доверяем валидированному LLM2")
+        confirmed = {match_hash(m): m for m in lv}
+    elif l2_un:
+        logging.info("Голосование: LLM2 недоступен, доверяем валидированному Gemini")
         confirmed = {match_hash(m): m for m in gv}
     else:
-        both = {match_hash(m) for m in gv} & {match_hash(m) for m in dv}
-        logging.info("Голосование: пересечение Gemini∩DeepSeek = %d", len(both))
-        for m in gv + dv:
+        both = {match_hash(m) for m in gv} & {match_hash(m) for m in lv}
+        logging.info("Голосование: пересечение Gemini∩LLM2 = %d", len(both))
+        for m in gv + lv:
             h = match_hash(m)
             if h in both:
                 confirmed.setdefault(h, m)
@@ -411,9 +512,7 @@ def scrape_all() -> list[dict]:
     for m in out:
         m.setdefault("hash", match_hash(m))
 
-    logging.info("=== ИТОГО: структурные=%d, добавлено LLM=%d ===",
-                 len(structural) - len(confirmed) + len([1 for h in confirmed if h in structural]),
-                 len(confirmed))
+    logging.info("=== ИТОГО: всего=%d (структурные+LLM) ===", len(out))
     for m in sorted(out, key=lambda x: x["date"]):
         logging.info("  %s %s  %s vs %s  [%s]", m["date"], m["time"], m["home"], m["away"], m["source"])
     return out
@@ -452,7 +551,7 @@ def format_msg(matches: list[dict]) -> str:
 if __name__ == "__main__":
     con = init_db()
 
-    logging.info("Парсинг: weltfussball + kicker + Gemini + DeepSeek (18 клубов)...")
+    logging.info("Парсинг: api-football + weltfussball + kicker + Gemini + LLM2(Qwen)...")
     matches = scrape_all()
     logging.info("Всего найдено: %d", len(matches))
 
