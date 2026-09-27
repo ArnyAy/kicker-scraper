@@ -1,20 +1,20 @@
 import html
 import re
 
-# Лексикон: признак НЕ первой команды / не товарищеского матча
+# Лексикон: признак НЕ первой команды / не товарищеского матча.
+# ВНИМАНИЕ: числовые токены (03/04/05) ЗАПРЕЩЕНЫ — они режут легитимные клубы
+# (Schweinfurt 05, Schalke 04, Mainz 05).
 SKIP_TOKENS = (
-    "u17", "u19", "u21", "u23", " ii", " iii", " iv",
+    " u17", " u19", " u21", " u23",
     " frauen", " women", " damen",
     " legenden", " traditionself", " allstars", " old stars",
     " junioren", " a-junioren", " b-junioren",
     " reserve", " amateure", " zweite",
-    " 03", " 04", " 05",  # внутриклубные: Hertha 03, Schalke 04 II и т.п.
     " u-",
 )
 
 STATUS_WORDS = {"ende": "finished", "live": "live", "abgesagt": "cancelled",
-                "verlegt": "postponed", "ausgefallen": "cancelled",
-                "n.v.": "finished", "i.e.": "finished"}
+                "verlegt": "postponed", "ausgefallen": "cancelled"}
 
 ABBR = {
     "k'lautern": "1. FC Kaiserslautern", "kaiserslautern": "1. FC Kaiserslautern",
@@ -43,5 +43,7 @@ def expand_club(s: str) -> str:
     return ABBR.get(norm_key(s), clean_name(s))
 
 def is_first_team_friendly(home: str, away: str) -> bool:
+    if norm_key(home) == norm_key(away):
+        return False  # внутриклубный
     t = (" " + home + " " + away + " ").lower()
     return not any(tok in t for tok in SKIP_TOKENS)
