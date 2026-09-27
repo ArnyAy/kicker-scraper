@@ -83,7 +83,43 @@ def save_cache(cache):
 def cache_key_for_day(today: date, name: str) -> str:
     return f"{name}:{today.isoformat()}"
 
-# ---------- Веб-поиск: Brave (если ключ) -> DuckDuckGo ----------
+# ---------- Retry helper (для 429 / 5xx) ----------
+def api_get(url, params, headers, timeout=25, retries=3):
+    delay = 2
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay); delay *= 2
+            continue
+        if r.status_code == 200:
+            return r
+        if r.status_code == 429:
+            wait = int(r.headers.get("x-ratelimit-reset", "0"))
+            # API-Football иногда шлёт "retry after N sec" в body
+            if wait <= 0:
+                try:
+                    msg = r.json().get("response", "")
+                    m = re.search(r"after\s+(\d+)", str(msg))
+                    if m: wait = int(m[1])
+                except Exception:
+                    pass
+            if wait <= 0:
+                wait = 60
+            logging.warning("API 429: ждём %dс (attempt %d/%d)", wait, attempt + 1, retries)
+            if attempt == retries - 1:
+                return r
+            time.sleep(wait)
+            continue
+        if r.status_code >= 500 and attempt < retries - 1:
+            time.sleep(delay); delay *= 2
+            continue
+        return r
+    return r
+
+# ---------- Веб-поиск: Brave -> DuckDuckGo ----------
 def web_search(query: str) -> list[dict]:
     key = os.environ.get("BRAVE_API_KEY")
     if key:
@@ -101,10 +137,8 @@ def web_search(query: str) -> list[dict]:
                 if hits:
                     logging.info("SEARCH: Brave, %d hits", len(hits))
                     return hits
-            else:
-                logging.warning("SEARCH: Brave HTTP %s, fallback DDG", r.status_code)
         except Exception as e:
-            logging.warning("SEARCH: Brave error %s, fallback DDG", e)
+            logging.warning("SEARCH: Brave error %s", e)
     try:
         from ddgs import DDGS
         with DDGS() as d:
@@ -146,7 +180,7 @@ def scrape_club(club: dict, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 2: kicker.de (автоотключение при WAF) ----------
+# ---------- Источник 2: kicker.de ----------
 KICKER_SLUGS = {
     "Hertha BSC": "hertha-bsc", "Hannover 96": "hannover-96",
     "1. FC Kaiserslautern": "1-fc-kaiserslautern", "1. FC Magdeburg": "1-fc-magdeburg",
@@ -201,21 +235,22 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: API-Football (FIXED: поиск по имени) ----------
+# ---------- Источник 3: API-Football (кэш команд + retry) ----------
 def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
         logging.info("API-FOOTBALL: нет ключа")
         return []
     H = {"x-apisports-key": key}
-    teams = cache.get("af_teams")
-    if not teams:
-        try:
-            teams = {}
-            for club in CLUBS:
-                r = requests.get(f"{AF_BASE}/teams",
-                                 params={"search": club["name"]},
-                                 headers=H, timeout=25)
+
+    teams = cache.get("af_teams") or {}
+    missing = [c for c in CLUBS if norm_key(c["name"]) not in teams]
+    if missing:
+        logging.info("API-FOOTBALL: ищу %d недостающих команд", len(missing))
+        for club in missing:
+            try:
+                r = api_get(f"{AF_BASE}/teams",
+                            params={"search": club["name"]}, headers=H)
                 if r.status_code != 200:
                     logging.error("API-FOOTBALL search %s HTTP %s", club["name"], r.status_code)
                     continue
@@ -226,15 +261,12 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
                     if nm and tid and country.lower() == "germany":
                         teams[norm_key(nm)] = tid
                         break
-                time.sleep(0.4)
-            if not teams:
-                logging.error("API-FOOTBALL: не найдено ни одной команды")
-                return []
+            except Exception as e:
+                logging.error("API-FOOTBALL %s: %s", club["name"], e)
+        if teams:
             cache["af_teams"] = teams
-            logging.info("API-FOOTBALL: найдено %d команд", len(teams))
-        except Exception as e:
-            logging.error("API-FOOTBALL teams: %s", e)
-            return []
+            logging.info("API-FOOTBALL: в кэше %d команд", len(teams))
+
     out = []
     for club in CLUBS:
         tid = teams.get(norm_key(club["name"]))
@@ -242,10 +274,10 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
             logging.info("API-FOOTBALL: нет ID для %s", club["name"])
             continue
         try:
-            r = requests.get(f"{AF_BASE}/fixtures",
-                             params={"team": tid, "season": 2026,
-                                     "from": today.isoformat(), "to": END_DATE.isoformat()},
-                             headers=H, timeout=25)
+            r = api_get(f"{AF_BASE}/fixtures",
+                        params={"team": tid, "season": 2026,
+                                "from": today.isoformat(), "to": END_DATE.isoformat()},
+                        headers=H)
             if r.status_code != 200:
                 logging.error("API-FOOTBALL fixtures %s HTTP %s", club["name"], r.status_code)
                 continue
@@ -279,13 +311,12 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
                     "source": "api-football",
                     "url": "https://www.api-football.com",
                 })
-            time.sleep(0.4)
         except Exception as e:
             logging.error("API-FOOTBALL %s: %s", club["name"], e)
     logging.info("API-FOOTBALL: %d Testspiele", len(out))
     return out
 
-# ---------- Источник 4: Gemini (None = недоступен) ----------
+# ---------- Источник 4: Gemini ----------
 def scrape_gemini(today: date, cache: dict):
     ck = cache_key_for_day(today, "gemini")
     if ck in cache:
@@ -348,16 +379,16 @@ def scrape_gemini(today: date, cache: dict):
     cache[ck] = rows
     return rows
 
-# ---------- Источник 5: LLM2 = Qwen (OpenRouter free) / fallback DeepSeek ----------
+# ---------- Источник 5: LLM2 (компактная free-модель) ----------
 def llm2_config():
     key = os.environ.get("LLM2_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     base = os.environ.get("LLM2_BASE_URL")
-    # Пустая строка считаем отсутствием — подставляем дефолт
     if not base or not base.strip():
         base = "https://openrouter.ai/api/v1"
     model = os.environ.get("LLM2_MODEL")
     if not model or not model.strip():
-        model = "qwen/qwen3-235b-a22b:free"
+        # Компактная free-модель: влезает в 2947 токенов free-аккаунта
+        model = "google/gemma-3-27b-it:free"
     if key:
         return base, key, model
     dk = os.environ.get("DEEPSEEK_API_KEY")
@@ -375,28 +406,29 @@ def scrape_llm2(today: date, cache: dict):
         logging.info("LLM2: нет ключа -> недоступен")
         return None
     logging.info("LLM2: base=%s model=%s", base, model)
+
+    # Короткий запрос — ищем по ОДНОМУ клубу за раз, чтобы вписаться в контекст
     clubs = ", ".join(c["name"] for c in CLUBS)
     hits = web_search(
-        f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 {clubs}"
+        f"2. Bundesliga Testspiele Freundschaftsspiele 2026 {clubs}"
     )
     if not hits:
         logging.info("LLM2: поиск вернул 0")
         return []
-    urls_text = "\n".join(f"- {h['title']} | {h['url']} | {h['snippet']}" for h in hits[:8])
+    urls_text = "\n".join(f"- {h['title']} | {h['url']} | {h['snippet']}" for h in hits[:5])
     prompt = (
-        f"Below are web search snippets about upcoming friendly matches (Testspiele) of "
-        f"2. Bundesliga clubs between {today.isoformat()} and {END_DATE.isoformat()}. "
-        f"Extract ONLY confirmed friendly matches of first teams. "
-        f"Skip U17/U19/U21/II/women/legends/mini-clubs. Do NOT invent data.\n\n"
-        f"{urls_text}\n\n"
+        f"Extract friendly matches of 2. Bundesliga clubs (Testspiele) from {today.isoformat()} "
+        f"to {END_DATE.isoformat()} from these snippets. Skip U17/U19/U21/II/women. "
+        f"Skip matches without a public source URL.\n\n{urls_text}\n\n"
         f"Reply ONLY a JSON array of objects: "
-        f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"...","source_url":"https://..."}}. '
-        f"No markdown. If nothing confirmed, reply [].\n"
+        f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"","source_url":"https://..."}}. '
+        f"No markdown. If none, reply [].\n"
     )
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
+        "max_tokens": 2000,
     }
     try:
         r = requests.post(f"{base}/chat/completions",
@@ -561,7 +593,7 @@ def format_msg(matches: list[dict]) -> str:
 if __name__ == "__main__":
     con = init_db()
 
-    logging.info("Парсинг: api-football + weltfussball + kicker + Gemini + LLM2(Qwen)...")
+    logging.info("Парсинг: api-football + weltfussball + kicker + Gemini + LLM2...")
     matches = scrape_all()
     logging.info("Всего найдено: %d", len(matches))
 
