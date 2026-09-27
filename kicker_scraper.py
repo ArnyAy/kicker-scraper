@@ -83,7 +83,7 @@ def save_cache(cache):
 def cache_key_for_day(today: date, name: str) -> str:
     return f"{name}:{today.isoformat()}"
 
-# ---------- Retry helper (для 429 / 5xx) ----------
+# ---------- Retry с backoff ----------
 def api_get(url, params, headers, timeout=25, retries=3):
     delay = 2
     for attempt in range(retries):
@@ -98,7 +98,6 @@ def api_get(url, params, headers, timeout=25, retries=3):
             return r
         if r.status_code == 429:
             wait = int(r.headers.get("x-ratelimit-reset", "0"))
-            # API-Football иногда шлёт "retry after N sec" в body
             if wait <= 0:
                 try:
                     msg = r.json().get("response", "")
@@ -119,7 +118,7 @@ def api_get(url, params, headers, timeout=25, retries=3):
         return r
     return r
 
-# ---------- Веб-поиск: Brave -> DuckDuckGo ----------
+# ---------- Веб-поиск ----------
 def web_search(query: str) -> list[dict]:
     key = os.environ.get("BRAVE_API_KEY")
     if key:
@@ -235,7 +234,16 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: API-Football (кэш команд + retry) ----------
+# ---------- Источник 3: API-Football (fallback-поиск) ----------
+def short_name(full: str) -> str:
+    """Убирает префиксы типа '1. FC', 'SV', 'SpVgg' для fallback-поиска."""
+    prefixes = ["1. fc ", "2. fc ", "fc ", "sv ", "spvgg ", "sc ", "vfl ", "ssv "]
+    low = full.lower()
+    for p in prefixes:
+        if low.startswith(p):
+            return full[len(p):].strip()
+    return full
+
 def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
@@ -249,18 +257,35 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
         logging.info("API-FOOTBALL: ищу %d недостающих команд", len(missing))
         for club in missing:
             try:
+                # Попытка 1: точное имя
                 r = api_get(f"{AF_BASE}/teams",
                             params={"search": club["name"]}, headers=H)
-                if r.status_code != 200:
-                    logging.error("API-FOOTBALL search %s HTTP %s", club["name"], r.status_code)
-                    continue
-                for t in r.json().get("response", []):
-                    nm = (t.get("team") or {}).get("name", "")
-                    tid = (t.get("team") or {}).get("id")
-                    country = (t.get("team") or {}).get("country", "")
-                    if nm and tid and country.lower() == "germany":
-                        teams[norm_key(nm)] = tid
-                        break
+                found = False
+                if r.status_code == 200:
+                    for t in r.json().get("response", []):
+                        nm = (t.get("team") or {}).get("name", "")
+                        tid = (t.get("team") or {}).get("id")
+                        country = (t.get("team") or {}).get("country", "")
+                        if nm and tid and country.lower() == "germany":
+                            teams[norm_key(nm)] = tid
+                            found = True
+                            break
+                
+                # Попытка 2: короткое имя (fallback)
+                if not found:
+                    short = short_name(club["name"])
+                    if short != club["name"]:
+                        logging.info("API-FOOTBALL: fallback %s -> %s", club["name"], short)
+                        r = api_get(f"{AF_BASE}/teams",
+                                    params={"search": short}, headers=H)
+                        if r.status_code == 200:
+                            for t in r.json().get("response", []):
+                                nm = (t.get("team") or {}).get("name", "")
+                                tid = (t.get("team") or {}).get("id")
+                                country = (t.get("team") or {}).get("country", "")
+                                if nm and tid and country.lower() == "germany":
+                                    teams[norm_key(club["name"])] = tid
+                                    break
             except Exception as e:
                 logging.error("API-FOOTBALL %s: %s", club["name"], e)
         if teams:
@@ -379,7 +404,7 @@ def scrape_gemini(today: date, cache: dict):
     cache[ck] = rows
     return rows
 
-# ---------- Источник 5: LLM2 (компактная free-модель) ----------
+# ---------- Источник 5: LLM2 (полный промпт + max_tokens) ----------
 def llm2_config():
     key = os.environ.get("LLM2_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     base = os.environ.get("LLM2_BASE_URL")
@@ -387,7 +412,6 @@ def llm2_config():
         base = "https://openrouter.ai/api/v1"
     model = os.environ.get("LLM2_MODEL")
     if not model or not model.strip():
-        # Компактная free-модель: влезает в 2947 токенов free-аккаунта
         model = "google/gemma-3-27b-it:free"
     if key:
         return base, key, model
@@ -407,22 +431,23 @@ def scrape_llm2(today: date, cache: dict):
         return None
     logging.info("LLM2: base=%s model=%s", base, model)
 
-    # Короткий запрос — ищем по ОДНОМУ клубу за раз, чтобы вписаться в контекст
     clubs = ", ".join(c["name"] for c in CLUBS)
     hits = web_search(
-        f"2. Bundesliga Testspiele Freundschaftsspiele 2026 {clubs}"
+        f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 {clubs}"
     )
     if not hits:
         logging.info("LLM2: поиск вернул 0")
         return []
     urls_text = "\n".join(f"- {h['title']} | {h['url']} | {h['snippet']}" for h in hits[:5])
     prompt = (
-        f"Extract friendly matches of 2. Bundesliga clubs (Testspiele) from {today.isoformat()} "
-        f"to {END_DATE.isoformat()} from these snippets. Skip U17/U19/U21/II/women. "
-        f"Skip matches without a public source URL.\n\n{urls_text}\n\n"
+        f"Below are web search snippets about upcoming friendly matches (Testspiele) of "
+        f"2. Bundesliga clubs between {today.isoformat()} and {END_DATE.isoformat()}. "
+        f"Extract ONLY confirmed friendly matches of first teams. "
+        f"Skip U17/U19/U21/II/women/legends/mini-clubs. Do NOT invent data.\n\n"
+        f"{urls_text}\n\n"
         f"Reply ONLY a JSON array of objects: "
-        f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"","source_url":"https://..."}}. '
-        f"No markdown. If none, reply [].\n"
+        f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"...","source_url":"https://..."}}. '
+        f"No markdown. If nothing confirmed, reply [].\n"
     )
     body = {
         "model": model,
@@ -459,7 +484,7 @@ def scrape_llm2(today: date, cache: dict):
     cache[ck] = rows
     return rows
 
-# ---------- Валидация сырых строк от LLM ----------
+# ---------- Валидация ----------
 def validate_llm_rows(rows: list, source: str) -> list[dict]:
     today = date.today()
     out = []
@@ -492,7 +517,7 @@ def validate_llm_rows(rows: list, source: str) -> list[dict]:
         })
     return out
 
-# ---------- Агрегатор + голосование ----------
+# ---------- Агрегатор ----------
 def scrape_all() -> list[dict]:
     today = date.today()
     cache = load_cache()
