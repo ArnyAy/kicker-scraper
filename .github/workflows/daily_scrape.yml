@@ -20,14 +20,33 @@ jobs:
           key: matches-db-${{ github.run_id }}
           restore-keys: |
             matches-db-
+      - name: Restore LLM cache
+        uses: actions/cache@v4
+        with:
+          path: llm_cache.json
+          key: llm-cache-${{ github.run_id }}
+          restore-keys: |
+            llm-cache-
       - run: python kicker_scraper.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          LLM2_API_KEY: ${{ secrets.LLM2_API_KEY }}
+          LLM2_BASE_URL: ${{ secrets.LLM2_BASE_URL }}
+          LLM2_MODEL: ${{ secrets.LLM2_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
       - name: Save DB
         if: always()
         uses: actions/cache/save@v4
         with:
           path: matches.db
           key: matches-db-${{ github.run_id }}
+      - name: Save LLM cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: llm_cache.json
+          key: llm-cache-${{ github.run_id }}
