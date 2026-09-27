@@ -20,6 +20,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 DB_PATH = "matches.db"
+CACHE_PATH = "llm_cache.json"
 S = requests.Session()
 S.headers.update(HEADERS)
 
@@ -28,6 +29,9 @@ KICKER_ENABLED = True
 
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
+BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 
 # ---------- DB ----------
 def init_db():
@@ -60,9 +64,60 @@ def url_relevant(url: str, home: str, away: str) -> bool:
         logging.info("URL check fail %s: %s", url, e)
         return False
 
+# ---------- Кэш LLM на сутки ----------
+def load_cache():
+    if os.path.exists(CACHE_PATH):
+        try:
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_cache(cache):
+    with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def cache_key_for_day(today: date, name: str) -> str:
+    return f"{name}:{today.isoformat()}"
+
+# ---------- Веб-поиск: Brave (если ключ) -> DuckDuckGo (без ключа) ----------
+def web_search(query: str) -> list[dict]:
+    key = os.environ.get("BRAVE_API_KEY")
+    if key:
+        try:
+            r = requests.get(BRAVE_URL,
+                             headers={"Accept": "application/json",
+                                      "X-Subscription-Token": key},
+                             params={"q": query, "count": 6, "search_lang": "de"},
+                             timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                hits = [{"url": h.get("url", ""), "title": h.get("title", ""),
+                         "snippet": h.get("description", "")}
+                        for h in data.get("web", {}).get("results", [])]
+                if hits:
+                    logging.info("SEARCH: Brave, %d hits", len(hits))
+                    return hits
+            else:
+                logging.warning("SEARCH: Brave HTTP %s, fallback DDG", r.status_code)
+        except Exception as e:
+            logging.warning("SEARCH: Brave error %s, fallback DDG", e)
+    try:
+        from ddgs import DDGS
+        with DDGS() as d:
+            res = d.text(query, max_results=6)
+        hits = [{"url": r.get("href", ""), "title": r.get("title", ""),
+                 "snippet": r.get("body", "")} for r in (res or [])]
+        logging.info("SEARCH: DuckDuckGo, %d hits", len(hits))
+        return hits
+    except Exception as e:
+        logging.error("SEARCH: DDG error %s", e)
+        return []
+
 # ---------- Источник 1: weltfussball.de ----------
 LABEL_RE = re.compile(
-    r"Fu[ßs]ball\s+Freundschaft\s+Vereine\s+Kalenderwoche\s+(.+?)\s+-\s+(.+?)\s+am\s+"
+    r"Fu[ßs]ball\s+Freundschaft\s+Vereine\s+Kalenderwoche\s+([^<\"\n]+?)\s+-\s+([^<\"\n]+?)\s+am\s+"
     r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}:\d{2})"
 )
 
@@ -79,13 +134,15 @@ def scrape_club(club: dict, today: date) -> list[dict]:
             continue
         if not is_first_team_friendly(home, away):
             continue
+        if not involves_our_club(home, away):
+            continue
         out.append({
             "date": d.isoformat(),
             "time": m.group(6),
             "home": home,
             "away": away,
             "venue": "",
-            "source": club["name"],
+            "source": "weltfussball",
             "url": url,
         })
     return out
@@ -140,19 +197,20 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         out.append({
             "date": d.isoformat(),
             "time": tm[0] if tm else "",
-            "home": home,
-            "away": away,
-            "venue": "",
-            "source": "kicker.de",
-            "url": url,
+            "home": home, "away": away,
+            "venue": "", "source": "kicker.de", "url": url,
         })
     return out
 
-# ---------- Источник 3: Gemini + Google Search + URL validation ----------
-def scrape_gemini(today: date) -> list[dict]:
+# ---------- Источник 3: Gemini + Google Search ----------
+def scrape_gemini(today: date, cache: dict) -> list:
     key = os.environ.get("GEMINI_API_KEY")
+    ck = cache_key_for_day(today, "gemini")
+    if ck in cache:
+        logging.info("GEMINI: кэш (%d)", len(cache[ck]))
+        return cache[ck]
     if not key:
-        logging.info("GEMINI: нет GEMINI_API_KEY, пропускаю")
+        logging.info("GEMINI: нет GEMINI_API_KEY")
         return []
     clubs = ", ".join(c["name"] for c in CLUBS)
     prompt = (
@@ -161,7 +219,7 @@ def scrape_gemini(today: date) -> list[dict]:
         f"between {today.isoformat()} and {END_DATE.isoformat()}: {clubs}. "
         f"Priority sources: kicker.de, official club websites, club social media, local press. "
         f"Rules:\n"
-        f"1. First teams only. NO U17/U19/U21/II/III/women/legends/reserves/intra-club matches.\n"
+        f"1. First teams only. NO U17/U19/U21/II/III/women/legends/reserves/intra-club/mini-club matches.\n"
         f"2. source_url is MANDATORY. Skip any match without a real public URL.\n"
         f"3. Do NOT invent matches. Only include matches you can verify on the cited page.\n"
         f"4. Date format DD.MM.YYYY; time HH:MM or empty string.\n"
@@ -180,6 +238,9 @@ def scrape_gemini(today: date) -> list[dict]:
                           json=body, timeout=(15, 180))
     except Exception as e:
         logging.error("GEMINI network: %s", e)
+        return []
+    if r.status_code == 429:
+        logging.warning("GEMINI: квота 429, пропускаем")
         return []
     if r.status_code != 200:
         logging.error("GEMINI HTTP %s: %s", r.status_code, r.text[:300])
@@ -200,7 +261,74 @@ def scrape_gemini(today: date) -> list[dict]:
         return []
     if not isinstance(rows, list):
         return []
-    logging.info("GEMINI: кандидатов до валидации %d", len(rows))
+    logging.info("GEMINI: кандидатов %d", len(rows))
+    cache[ck] = rows
+    return rows
+
+# ---------- Источник 4: веб-поиск + DeepSeek ----------
+def scrape_deepseek(today: date, cache: dict) -> list:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    ck = cache_key_for_day(today, "deepseek")
+    if ck in cache:
+        logging.info("DEEPSEEK: кэш (%d)", len(cache[ck]))
+        return cache[ck]
+    if not key:
+        logging.info("DEEPSEEK: нет ключа")
+        return []
+    clubs = ", ".join(c["name"] for c in CLUBS)
+    hits = web_search(
+        f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 "
+        f"{clubs}"
+    )
+    if not hits:
+        logging.info("DEEPSEEK: поиск вернул 0")
+        return []
+    urls_text = "\n".join(f"- {h['title']} | {h['url']} | {h['snippet']}" for h in hits[:8])
+    prompt = (
+        f"Below are web search snippets about upcoming friendly matches (Testspiele) of "
+        f"2. Bundesliga clubs between {today.isoformat()} and {END_DATE.isoformat()}. "
+        f"Extract ONLY confirmed friendly matches of first teams. "
+        f"Skip U17/U19/U21/II/women/legends/mini-clubs. Do NOT invent data.\n\n"
+        f"{urls_text}\n\n"
+        f"Reply ONLY a JSON array of objects: "
+        f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"...","source_url":"https://..."}}. '
+        f"No markdown. If nothing confirmed, reply [].\n"
+    )
+    body = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        r = requests.post(DEEPSEEK_URL,
+                          headers={"Authorization": f"Bearer {key}",
+                                   "Content-Type": "application/json"},
+                          json=body, timeout=(15, 120))
+    except Exception as e:
+        logging.error("DEEPSEEK network: %s", e)
+        return []
+    if r.status_code != 200:
+        logging.error("DEEPSEEK HTTP %s: %s", r.status_code, r.text[:300])
+        return []
+    try:
+        content = r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.error("DEEPSEEK parse: %s", e)
+        return []
+    try:
+        rows = json.loads(content)
+    except Exception:
+        rows = []
+    if not isinstance(rows, list):
+        rows = []
+    logging.info("DEEPSEEK: кандидатов %d", len(rows))
+    cache[ck] = rows
+    return rows
+
+# ---------- Валидация сырых строк от LLM ----------
+def validate_llm_rows(rows: list, source: str) -> list[dict]:
+    today = date.today()
     out = []
     for row in rows:
         if not isinstance(row, dict):
@@ -219,29 +347,28 @@ def scrape_gemini(today: date) -> list[dict]:
         if not is_first_team_friendly(home, away):
             continue
         if not url_relevant(url, home, away):
-            logging.info("GEMINI skip (URL invalid): %s vs %s %s", home, away, url)
+            logging.info("%s skip (URL invalid): %s vs %s %s", source, home, away, url)
             continue
         tm = re.search(r"\b\d{1,2}:\d{2}\b", row.get("time", ""))
         out.append({
             "date": d.isoformat(),
             "time": tm[0] if tm else "",
-            "home": home,
-            "away": away,
+            "home": home, "away": away,
             "venue": (row.get("venue") or "").strip(),
-            "source": "Gemini search",
-            "url": url,
+            "source": source, "url": url,
         })
-    logging.info("GEMINI: после валидации %d", len(out))
     return out
 
-# ---------- Агрегатор ----------
+# ---------- Агрегатор с голосованием ----------
 def scrape_all() -> list[dict]:
     today = date.today()
-    seen, out = set(), []
+    cache = load_cache()
+
+    structural = {}
     for club in CLUBS:
         ms = []
         try:
-            ms = scrape_club(club, today)
+            ms += scrape_club(club, today)
         except Exception as e:
             logging.error("WF %s: %s", club["name"], e)
         try:
@@ -250,22 +377,40 @@ def scrape_all() -> list[dict]:
             logging.error("KICKER %s: %s", club["name"], e)
         logging.info("✓ %s: %d Testspiele", club["name"], len(ms))
         for m in ms:
-            h = match_hash(m)
-            if h not in seen:
-                seen.add(h)
-                m["hash"] = h
-                out.append(m)
+            structural[match_hash(m)] = m
+
+    gemini_raw = []
     try:
-        for m in scrape_gemini(today):
-            h = match_hash(m)
-            if h not in seen:
-                seen.add(h)
-                m["hash"] = h
-                out.append(m)
+        gemini_raw = scrape_gemini(today, cache)
     except Exception as e:
         logging.error("GEMINI aggregate: %s", e)
-    # ДИАГНОСТИКА: выводим все найденные матчи в лог
-    logging.info("=== ВСЕ НАЙДЕННЫЕ МАТЧИ ===")
+    gemini_valid = validate_llm_rows(gemini_raw, "Gemini")
+
+    deepseek_raw = []
+    try:
+        deepseek_raw = scrape_deepseek(today, cache)
+    except Exception as e:
+        logging.error("DEEPSEEK aggregate: %s", e)
+    deepseek_valid = validate_llm_rows(deepseek_raw, "DeepSeek")
+
+    save_cache(cache)
+
+    gemini_hashes = {match_hash(m) for m in gemini_valid}
+    deepseek_hashes = {match_hash(m) for m in deepseek_valid}
+    both_llm = gemini_hashes & deepseek_hashes
+    confirmed_ll = {}
+    for m in gemini_valid + deepseek_valid:
+        h = match_hash(m)
+        if h in structural or h in both_llm:
+            confirmed_ll.setdefault(h, m)
+
+    out = list(structural.values())
+    for h, m in confirmed_ll.items():
+        if h not in structural:
+            out.append(m)
+
+    logging.info("=== ИТОГО: структурные=%d, LLM после голосования=%d ===",
+                 len(structural), len(confirmed_ll))
     for m in sorted(out, key=lambda x: x["date"]):
         logging.info("  %s %s  %s vs %s  [%s]", m["date"], m["time"], m["home"], m["away"], m["source"])
     return out
@@ -304,7 +449,7 @@ def format_msg(matches: list[dict]) -> str:
 if __name__ == "__main__":
     con = init_db()
 
-    logging.info("Парсинг: weltfussball + kicker + Gemini (18 клубов)...")
+    logging.info("Парсинг: weltfussball + kicker + Gemini + DeepSeek (18 клубов)...")
     matches = scrape_all()
     logging.info("Всего найдено: %d", len(matches))
 
