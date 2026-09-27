@@ -81,7 +81,7 @@ def save_cache(cache):
 def cache_key_for_day(today: date, name: str) -> str:
     return f"{name}:{today.isoformat()}"
 
-# ---------- Веб-поиск: Brave (если ключ) -> DuckDuckGo (без ключа) ----------
+# ---------- Веб-поиск: Brave (если ключ) -> DuckDuckGo ----------
 def web_search(query: str) -> list[dict]:
     key = os.environ.get("BRAVE_API_KEY")
     if key:
@@ -202,16 +202,16 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: Gemini + Google Search ----------
-def scrape_gemini(today: date, cache: dict) -> list:
-    key = os.environ.get("GEMINI_API_KEY")
+# ---------- Источник 3: Gemini (None = недоступен) ----------
+def scrape_gemini(today: date, cache: dict):
     ck = cache_key_for_day(today, "gemini")
     if ck in cache:
         logging.info("GEMINI: кэш (%d)", len(cache[ck]))
         return cache[ck]
+    key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        logging.info("GEMINI: нет GEMINI_API_KEY")
-        return []
+        logging.info("GEMINI: нет ключа -> недоступен")
+        return None
     clubs = ", ".join(c["name"] for c in CLUBS)
     prompt = (
         f"Today is {today.isoformat()}. Use Google Search to find ONLY confirmed upcoming "
@@ -219,7 +219,7 @@ def scrape_gemini(today: date, cache: dict) -> list:
         f"between {today.isoformat()} and {END_DATE.isoformat()}: {clubs}. "
         f"Priority sources: kicker.de, official club websites, club social media, local press. "
         f"Rules:\n"
-        f"1. First teams only. NO U17/U19/U21/II/III/women/legends/reserves/intra-club/mini-club matches.\n"
+        f"1. First teams only. NO U17/U19/U21/II/III/women/legends/reserves/intra-club matches.\n"
         f"2. source_url is MANDATORY. Skip any match without a real public URL.\n"
         f"3. Do NOT invent matches. Only include matches you can verify on the cited page.\n"
         f"4. Date format DD.MM.YYYY; time HH:MM or empty string.\n"
@@ -237,48 +237,47 @@ def scrape_gemini(today: date, cache: dict) -> list:
                           headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                           json=body, timeout=(15, 180))
     except Exception as e:
-        logging.error("GEMINI network: %s", e)
-        return []
+        logging.error("GEMINI network: %s -> недоступен", e)
+        return None
     if r.status_code == 429:
-        logging.warning("GEMINI: квота 429, пропускаем")
-        return []
+        logging.warning("GEMINI: квота 429 -> недоступен сегодня")
+        return None
     if r.status_code != 200:
-        logging.error("GEMINI HTTP %s: %s", r.status_code, r.text[:300])
-        return []
+        logging.error("GEMINI HTTP %s: %s -> недоступен", r.status_code, r.text[:200])
+        return None
     try:
         data = r.json()
         content = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
     except Exception as e:
-        logging.error("GEMINI parse: %s", e)
-        return []
+        logging.error("GEMINI parse: %s -> недоступен", e)
+        return None
     if content.startswith("```"):
         content = re.sub(r"^```[a-z]*\n?", "", content)
         content = re.sub(r"\n?```$", "", content)
     try:
         rows = json.loads(content)
     except Exception as e:
-        logging.error("GEMINI JSON: %s | %s", e, content[:300])
-        return []
+        logging.error("GEMINI JSON: %s -> недоступен", e)
+        return None
     if not isinstance(rows, list):
-        return []
+        rows = []
     logging.info("GEMINI: кандидатов %d", len(rows))
     cache[ck] = rows
     return rows
 
-# ---------- Источник 4: веб-поиск + DeepSeek ----------
-def scrape_deepseek(today: date, cache: dict) -> list:
-    key = os.environ.get("DEEPSEEK_API_KEY")
+# ---------- Источник 4: поиск + DeepSeek (None = недоступен) ----------
+def scrape_deepseek(today: date, cache: dict):
     ck = cache_key_for_day(today, "deepseek")
     if ck in cache:
         logging.info("DEEPSEEK: кэш (%d)", len(cache[ck]))
         return cache[ck]
+    key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
-        logging.info("DEEPSEEK: нет ключа")
-        return []
+        logging.info("DEEPSEEK: нет ключа -> недоступен")
+        return None
     clubs = ", ".join(c["name"] for c in CLUBS)
     hits = web_search(
-        f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 "
-        f"{clubs}"
+        f"2. Bundesliga Testspiele Freundschaftsspiele Oktober November Dezember 2026 {clubs}"
     )
     if not hits:
         logging.info("DEEPSEEK: поиск вернул 0")
@@ -306,16 +305,16 @@ def scrape_deepseek(today: date, cache: dict) -> list:
                                    "Content-Type": "application/json"},
                           json=body, timeout=(15, 120))
     except Exception as e:
-        logging.error("DEEPSEEK network: %s", e)
-        return []
+        logging.error("DEEPSEEK network: %s -> недоступен", e)
+        return None
     if r.status_code != 200:
-        logging.error("DEEPSEEK HTTP %s: %s", r.status_code, r.text[:300])
-        return []
+        logging.error("DEEPSEEK HTTP %s: %s -> недоступен", r.status_code, r.text[:200])
+        return None
     try:
         content = r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error("DEEPSEEK parse: %s", e)
-        return []
+        logging.error("DEEPSEEK parse: %s -> недоступен", e)
+        return None
     try:
         rows = json.loads(content)
     except Exception:
@@ -359,7 +358,7 @@ def validate_llm_rows(rows: list, source: str) -> list[dict]:
         })
     return out
 
-# ---------- Агрегатор с голосованием ----------
+# ---------- Агрегатор + голосование ----------
 def scrape_all() -> list[dict]:
     today = date.today()
     cache = load_cache()
@@ -377,40 +376,44 @@ def scrape_all() -> list[dict]:
             logging.error("KICKER %s: %s", club["name"], e)
         logging.info("✓ %s: %d Testspiele", club["name"], len(ms))
         for m in ms:
-            structural[match_hash(m)] = m
+            h = match_hash(m)
+            m["hash"] = h
+            structural[h] = m
 
-    gemini_raw = []
-    try:
-        gemini_raw = scrape_gemini(today, cache)
-    except Exception as e:
-        logging.error("GEMINI aggregate: %s", e)
-    gemini_valid = validate_llm_rows(gemini_raw, "Gemini")
-
-    deepseek_raw = []
-    try:
-        deepseek_raw = scrape_deepseek(today, cache)
-    except Exception as e:
-        logging.error("DEEPSEEK aggregate: %s", e)
-    deepseek_valid = validate_llm_rows(deepseek_raw, "DeepSeek")
-
+    g = scrape_gemini(today, cache)
+    d = scrape_deepseek(today, cache)
+    g_un, d_un = (g is None), (d is None)
+    gv = validate_llm_rows(g or [], "Gemini")
+    dv = validate_llm_rows(d or [], "DeepSeek")
     save_cache(cache)
 
-    gemini_hashes = {match_hash(m) for m in gemini_valid}
-    deepseek_hashes = {match_hash(m) for m in deepseek_valid}
-    both_llm = gemini_hashes & deepseek_hashes
-    confirmed_ll = {}
-    for m in gemini_valid + deepseek_valid:
-        h = match_hash(m)
-        if h in structural or h in both_llm:
-            confirmed_ll.setdefault(h, m)
+    confirmed = {}
+    if g_un and d_un:
+        logging.info("Голосование: оба LLM недоступны, только структурные")
+    elif g_un:
+        logging.info("Голосование: Gemini недоступен, доверяем валидированному DeepSeek")
+        confirmed = {match_hash(m): m for m in dv}
+    elif d_un:
+        logging.info("Голосование: DeepSeek недоступен, доверяем валидированному Gemini")
+        confirmed = {match_hash(m): m for m in gv}
+    else:
+        both = {match_hash(m) for m in gv} & {match_hash(m) for m in dv}
+        logging.info("Голосование: пересечение Gemini∩DeepSeek = %d", len(both))
+        for m in gv + dv:
+            h = match_hash(m)
+            if h in both:
+                confirmed.setdefault(h, m)
+
+    for h, m in confirmed.items():
+        structural.setdefault(h, m)
 
     out = list(structural.values())
-    for h, m in confirmed_ll.items():
-        if h not in structural:
-            out.append(m)
+    for m in out:
+        m.setdefault("hash", match_hash(m))
 
-    logging.info("=== ИТОГО: структурные=%d, LLM после голосования=%d ===",
-                 len(structural), len(confirmed_ll))
+    logging.info("=== ИТОГО: структурные=%d, добавлено LLM=%d ===",
+                 len(structural) - len(confirmed) + len([1 for h in confirmed if h in structural]),
+                 len(confirmed))
     for m in sorted(out, key=lambda x: x["date"]):
         logging.info("  %s %s  %s vs %s  [%s]", m["date"], m["time"], m["home"], m["away"], m["source"])
     return out
