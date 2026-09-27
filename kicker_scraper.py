@@ -83,7 +83,7 @@ def save_cache(cache):
 def cache_key_for_day(today: date, name: str) -> str:
     return f"{name}:{today.isoformat()}"
 
-# ---------- Retry с backoff ----------
+# ---------- Retry ----------
 def api_get(url, params, headers, timeout=25, retries=3):
     delay = 2
     for attempt in range(retries):
@@ -234,16 +234,40 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: API-Football (fallback-поиск) ----------
-def short_name(full: str) -> str:
-    """Убирает префиксы типа '1. FC', 'SV', 'SpVgg' для fallback-поиска."""
-    prefixes = ["1. fc ", "2. fc ", "fc ", "sv ", "spvgg ", "sc ", "vfl ", "ssv "]
-    low = full.lower()
-    for p in prefixes:
-        if low.startswith(p):
-            return full[len(p):].strip()
-    return full
+# ---------- Транслитерация умляутов ----------
+def transliterate(s: str) -> str:
+    """Fürth -> Furth, Düsseldorf -> Dusseldorf, Preußen -> Preussen, Nürnberg -> Nurnberg."""
+    return (s.replace("ä", "a").replace("ö", "o").replace("ü", "u")
+             .replace("Ä", "A").replace("Ö", "O").replace("Ü", "U")
+             .replace("ß", "ss"))
 
+def search_variants(name: str) -> list[str]:
+    """Генерирует варианты для поиска: точное имя, короткое, транслитерация."""
+    variants = [name]
+    
+    # Убираем префиксы
+    prefixes = ["1. FC ", "2. FC ", "FC ", "SV ", "SpVgg ", "SC ", "VfL ", "SSV "]
+    low = name.lower()
+    for p in prefixes:
+        if low.startswith(p.lower()):
+            short = name[len(p):].strip()
+            variants.append(short)
+            break
+    
+    # Добавляем транслитерацию
+    trans = transliterate(name)
+    if trans != name:
+        variants.append(trans)
+    
+    # Транслитерация короткого имени
+    if len(variants) >= 2:
+        trans_short = transliterate(variants[1])
+        if trans_short != variants[1]:
+            variants.append(trans_short)
+    
+    return list(dict.fromkeys(variants))  # удаляем дубли, сохраняя порядок
+
+# ---------- Источник 3: API-Football (с транслитерацией) ----------
 def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
@@ -257,35 +281,28 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
         logging.info("API-FOOTBALL: ищу %d недостающих команд", len(missing))
         for club in missing:
             try:
-                # Попытка 1: точное имя
-                r = api_get(f"{AF_BASE}/teams",
-                            params={"search": club["name"]}, headers=H)
+                variants = search_variants(club["name"])
                 found = False
-                if r.status_code == 200:
+                for v in variants:
+                    r = api_get(f"{AF_BASE}/teams",
+                                params={"search": v}, headers=H)
+                    if r.status_code != 200:
+                        continue
                     for t in r.json().get("response", []):
                         nm = (t.get("team") or {}).get("name", "")
                         tid = (t.get("team") or {}).get("id")
                         country = (t.get("team") or {}).get("country", "")
                         if nm and tid and country.lower() == "germany":
-                            teams[norm_key(nm)] = tid
+                            teams[norm_key(club["name"])] = tid
                             found = True
+                            logging.info("API-FOOTBALL: найдено %s -> %s (variant: %s)",
+                                         club["name"], nm, v)
                             break
-                
-                # Попытка 2: короткое имя (fallback)
+                    if found:
+                        break
                 if not found:
-                    short = short_name(club["name"])
-                    if short != club["name"]:
-                        logging.info("API-FOOTBALL: fallback %s -> %s", club["name"], short)
-                        r = api_get(f"{AF_BASE}/teams",
-                                    params={"search": short}, headers=H)
-                        if r.status_code == 200:
-                            for t in r.json().get("response", []):
-                                nm = (t.get("team") or {}).get("name", "")
-                                tid = (t.get("team") or {}).get("id")
-                                country = (t.get("team") or {}).get("country", "")
-                                if nm and tid and country.lower() == "germany":
-                                    teams[norm_key(club["name"])] = tid
-                                    break
+                    logging.warning("API-FOOTBALL: не найдено %s (пробовал: %s)",
+                                    club["name"], ", ".join(variants))
             except Exception as e:
                 logging.error("API-FOOTBALL %s: %s", club["name"], e)
         if teams:
@@ -404,7 +421,7 @@ def scrape_gemini(today: date, cache: dict):
     cache[ck] = rows
     return rows
 
-# ---------- Источник 5: LLM2 (полный промпт + max_tokens) ----------
+# ---------- Источник 5: LLM2 ----------
 def llm2_config():
     key = os.environ.get("LLM2_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     base = os.environ.get("LLM2_BASE_URL")
