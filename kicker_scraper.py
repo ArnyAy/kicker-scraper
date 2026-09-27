@@ -26,6 +26,9 @@ S.headers.update(HEADERS)
 OUR_KEYS = {norm_key(c["name"]) for c in CLUBS}
 KICKER_ENABLED = True
 
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
 # ---------- DB ----------
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -40,6 +43,23 @@ def match_hash(m: dict) -> str:
 
 def involves_our_club(home: str, away: str) -> bool:
     return norm_key(home) in OUR_KEYS or norm_key(away) in OUR_KEYS
+
+def url_relevant(url: str, home: str, away: str) -> bool:
+    """Проверка: URL жив + содержит имя хотя бы одной команды."""
+    if not url.startswith("http"):
+        return False
+    try:
+        r = requests.get(url, timeout=12, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; FriendlyTracker/1.0)",
+            "Accept-Language": "de-DE,de;q=0.9",
+        }, allow_redirects=True)
+        if r.status_code >= 400:
+            return False
+        body = r.text.lower()
+        return norm_key(home) in norm_key(body) or norm_key(away) in norm_key(body)
+    except Exception as e:
+        logging.info("URL check fail %s: %s", url, e)
+        return False
 
 # ---------- Источник 1: weltfussball.de ----------
 LABEL_RE = re.compile(
@@ -129,48 +149,47 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Источник 3: KIMI (Moonshot) + веб-поиск ----------
-KIMI_BASE = os.environ.get("MOONSHOT_BASE", "https://api.moonshot.ai/v1")
-KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2-0905-preview")
-
-def scrape_kimi(today: date) -> list[dict]:
-    key = os.environ.get("MOONSHOT_API_KEY")
+# ---------- Источник 3: Gemini + Google Search + URL validation ----------
+def scrape_gemini(today: date) -> list[dict]:
+    key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        logging.info("KIMI: нет MOONSHOT_API_KEY, пропускаю")
+        logging.info("GEMINI: нет GEMINI_API_KEY, пропускаю")
         return []
     clubs = ", ".join(c["name"] for c in CLUBS)
     prompt = (
-        f"Today is {today.isoformat()}. Use web search to find ALL confirmed upcoming "
+        f"Today is {today.isoformat()}. Use Google Search to find ONLY confirmed upcoming "
         f"friendly matches (Testspiele / Freundschaftsspiele) of these 2. Bundesliga clubs "
         f"between {today.isoformat()} and {END_DATE.isoformat()}: {clubs}. "
-        f"Search kicker.de, official club websites, club social media, local press. "
-        f"Rules: first teams only; NO U17/U19/U21/II/women/legends; ONLY matches with a "
-        f"public source URL; date format DD.MM.YYYY; time HH:MM or empty string if unknown; "
-        f"venue or empty string. Reply ONLY with a JSON array of objects: "
+        f"Priority sources: kicker.de, official club websites, club social media, local press. "
+        f"Rules:\n"
+        f"1. First teams only. NO U17/U19/U21/II/women/legends matches.\n"
+        f"2. source_url is MANDATORY. Skip any match without a real public URL.\n"
+        f"3. Do NOT invent matches. Only include matches you can verify on the cited page.\n"
+        f"4. Date format DD.MM.YYYY; time HH:MM or empty string.\n"
+        f"Reply ONLY a valid JSON array of objects: "
         f'{{"date":"DD.MM.YYYY","time":"HH:MM","home":"...","away":"...","venue":"...","source_url":"https://..."}}. '
-        f"No markdown, no comments. If nothing found, reply []."
+        f"No markdown. If nothing confirmed, reply [].\n"
     )
     body = {
-        "model": KIMI_MODEL,
-        "temperature": 0.1,
-        "messages": [{"role": "user", "content": prompt}],
-        "tools": [{"type": "builtin_function", "function": {"name": "$web_search"}}],
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1}
     }
     try:
-        r = requests.post(f"{KIMI_BASE}/chat/completions",
-                          headers={"Authorization": f"Bearer {key}",
-                                   "Content-Type": "application/json"},
-                          json=body, timeout=(10, 180))
+        r = requests.post(GEMINI_URL,
+                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                          json=body, timeout=(15, 180))
     except Exception as e:
-        logging.error("KIMI network: %s", e)
+        logging.error("GEMINI network: %s", e)
         return []
     if r.status_code != 200:
-        logging.error("KIMI HTTP %s: %s", r.status_code, r.text[:300])
+        logging.error("GEMINI HTTP %s: %s", r.status_code, r.text[:300])
         return []
     try:
-        content = r.json()["choices"][0]["message"]["content"].strip()
+        data = r.json()
+        content = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
     except Exception as e:
-        logging.error("KIMI parse: %s", e)
+        logging.error("GEMINI parse: %s", e)
         return []
     if content.startswith("```"):
         content = re.sub(r"^```[a-z]*\n?", "", content)
@@ -178,17 +197,16 @@ def scrape_kimi(today: date) -> list[dict]:
     try:
         rows = json.loads(content)
     except Exception as e:
-        logging.error("KIMI JSON: %s | %s", e, content[:300])
+        logging.error("GEMINI JSON: %s | %s", e, content[:300])
         return []
     if not isinstance(rows, list):
         return []
+    logging.info("GEMINI: кандидатов до валидации %d", len(rows))
     out = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         url = (row.get("source_url") or "").strip()
-        if not url.startswith("http"):
-            continue
         dm = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", row.get("date", ""))
         if not dm:
             continue
@@ -201,6 +219,10 @@ def scrape_kimi(today: date) -> list[dict]:
             continue
         if not is_first_team_friendly(home, away):
             continue
+        # Жёсткая валидация URL
+        if not url_relevant(url, home, away):
+            logging.info("GEMINI skip (URL invalid): %s vs %s %s", home, away, url)
+            continue
         tm = re.search(r"\b\d{1,2}:\d{2}\b", row.get("time", ""))
         out.append({
             "date": d.isoformat(),
@@ -208,10 +230,10 @@ def scrape_kimi(today: date) -> list[dict]:
             "home": home,
             "away": away,
             "venue": (row.get("venue") or "").strip(),
-            "source": "KIMI search",
+            "source": "Gemini search",
             "url": url,
         })
-    logging.info("KIMI: кандидатов %d", len(out))
+    logging.info("GEMINI: после валидации %d", len(out))
     return out
 
 # ---------- Агрегатор ----------
@@ -236,14 +258,14 @@ def scrape_all() -> list[dict]:
                 m["hash"] = h
                 out.append(m)
     try:
-        for m in scrape_kimi(today):
+        for m in scrape_gemini(today):
             h = match_hash(m)
             if h not in seen:
                 seen.add(h)
                 m["hash"] = h
                 out.append(m)
     except Exception as e:
-        logging.error("KIMI aggregate: %s", e)
+        logging.error("GEMINI aggregate: %s", e)
     return out
 
 # ---------- Telegram ----------
@@ -280,7 +302,7 @@ def format_msg(matches: list[dict]) -> str:
 if __name__ == "__main__":
     con = init_db()
 
-    logging.info("Парсинг: weltfussball.de + kicker.de + KIMI (18 клубов)...")
+    logging.info("Парсинг: weltfussball + kicker + Gemini (18 клубов)...")
     matches = scrape_all()
     logging.info("Всего найдено: %d", len(matches))
 
