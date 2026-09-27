@@ -2,15 +2,20 @@ import html
 import re
 
 # Лексикон: признак НЕ первой команды / не товарищеского матча
-SKIP_TOKENS = ("u17", "u19", "u21", "u23", " ii", "frauen", "women",
-               "legenden", "traditionself", "allstars", "junioren", "a-junioren")
+SKIP_TOKENS = (
+    "u17", "u19", "u21", "u23", " ii", " iii", " iv",
+    " frauen", " women", " damen",
+    " legenden", " traditionself", " allstars", " old stars",
+    " junioren", " a-junioren", " b-junioren",
+    " reserve", " amateure", " zweite",
+    " 03", " 04", " 05",  # внутриклубные: Hertha 03, Schalke 04 II и т.п.
+    " u-",
+)
 
-# Лексикон статусов (kicker / weltfussball) — для будущих шагов
 STATUS_WORDS = {"ende": "finished", "live": "live", "abgesagt": "cancelled",
                 "verlegt": "postponed", "ausgefallen": "cancelled",
                 "n.v.": "finished", "i.e.": "finished"}
 
-# Сокращения -> официальные имена (единый вид для всех источников)
 ABBR = {
     "k'lautern": "1. FC Kaiserslautern", "kaiserslautern": "1. FC Kaiserslautern",
     "gr furth": "SpVgg Greuther Fürth", "furth": "SpVgg Greuther Fürth",
@@ -38,5 +43,5 @@ def expand_club(s: str) -> str:
     return ABBR.get(norm_key(s), clean_name(s))
 
 def is_first_team_friendly(home: str, away: str) -> bool:
-    t = (home + " " + away).lower()
+    t = (" " + home + " " + away + " ").lower()
     return not any(tok in t for tok in SKIP_TOKENS)
