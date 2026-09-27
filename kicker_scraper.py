@@ -26,7 +26,7 @@ S.headers.update(HEADERS)
 OUR_KEYS = {norm_key(c["name"]) for c in CLUBS}
 KICKER_ENABLED = True
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # ---------- DB ----------
@@ -45,7 +45,6 @@ def involves_our_club(home: str, away: str) -> bool:
     return norm_key(home) in OUR_KEYS or norm_key(away) in OUR_KEYS
 
 def url_relevant(url: str, home: str, away: str) -> bool:
-    """Проверка: URL жив + содержит имя хотя бы одной команды."""
     if not url.startswith("http"):
         return False
     try:
@@ -162,7 +161,7 @@ def scrape_gemini(today: date) -> list[dict]:
         f"between {today.isoformat()} and {END_DATE.isoformat()}: {clubs}. "
         f"Priority sources: kicker.de, official club websites, club social media, local press. "
         f"Rules:\n"
-        f"1. First teams only. NO U17/U19/U21/II/women/legends matches.\n"
+        f"1. First teams only. NO U17/U19/U21/II/III/women/legends/reserves/intra-club matches.\n"
         f"2. source_url is MANDATORY. Skip any match without a real public URL.\n"
         f"3. Do NOT invent matches. Only include matches you can verify on the cited page.\n"
         f"4. Date format DD.MM.YYYY; time HH:MM or empty string.\n"
@@ -219,7 +218,6 @@ def scrape_gemini(today: date) -> list[dict]:
             continue
         if not is_first_team_friendly(home, away):
             continue
-        # Жёсткая валидация URL
         if not url_relevant(url, home, away):
             logging.info("GEMINI skip (URL invalid): %s vs %s %s", home, away, url)
             continue
@@ -266,6 +264,10 @@ def scrape_all() -> list[dict]:
                 out.append(m)
     except Exception as e:
         logging.error("GEMINI aggregate: %s", e)
+    # ДИАГНОСТИКА: выводим все найденные матчи в лог
+    logging.info("=== ВСЕ НАЙДЕННЫЕ МАТЧИ ===")
+    for m in sorted(out, key=lambda x: x["date"]):
+        logging.info("  %s %s  %s vs %s  [%s]", m["date"], m["time"], m["home"], m["away"], m["source"])
     return out
 
 # ---------- Telegram ----------
