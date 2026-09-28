@@ -234,40 +234,30 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         })
     return out
 
-# ---------- Транслитерация умляутов ----------
+# ---------- Транслитерация ----------
 def transliterate(s: str) -> str:
-    """Fürth -> Furth, Düsseldorf -> Dusseldorf, Preußen -> Preussen, Nürnberg -> Nurnberg."""
     return (s.replace("ä", "a").replace("ö", "o").replace("ü", "u")
              .replace("Ä", "A").replace("Ö", "O").replace("Ü", "U")
              .replace("ß", "ss"))
 
 def search_variants(name: str) -> list[str]:
-    """Генерирует варианты для поиска: точное имя, короткое, транслитерация."""
     variants = [name]
-    
-    # Убираем префиксы
     prefixes = ["1. FC ", "2. FC ", "FC ", "SV ", "SpVgg ", "SC ", "VfL ", "SSV "]
     low = name.lower()
     for p in prefixes:
         if low.startswith(p.lower()):
-            short = name[len(p):].strip()
-            variants.append(short)
+            variants.append(name[len(p):].strip())
             break
-    
-    # Добавляем транслитерацию
     trans = transliterate(name)
     if trans != name:
         variants.append(trans)
-    
-    # Транслитерация короткого имени
     if len(variants) >= 2:
         trans_short = transliterate(variants[1])
         if trans_short != variants[1]:
             variants.append(trans_short)
-    
-    return list(dict.fromkeys(variants))  # удаляем дубли, сохраняя порядок
+    return list(dict.fromkeys(variants))
 
-# ---------- Источник 3: API-Football (с транслитерацией) ----------
+# ---------- Источник 3: API-Football ----------
 def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
@@ -281,11 +271,9 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
         logging.info("API-FOOTBALL: ищу %d недостающих команд", len(missing))
         for club in missing:
             try:
-                variants = search_variants(club["name"])
                 found = False
-                for v in variants:
-                    r = api_get(f"{AF_BASE}/teams",
-                                params={"search": v}, headers=H)
+                for v in search_variants(club["name"]):
+                    r = api_get(f"{AF_BASE}/teams", params={"search": v}, headers=H)
                     if r.status_code != 200:
                         continue
                     for t in r.json().get("response", []):
@@ -301,8 +289,7 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
                     if found:
                         break
                 if not found:
-                    logging.warning("API-FOOTBALL: не найдено %s (пробовал: %s)",
-                                    club["name"], ", ".join(variants))
+                    logging.warning("API-FOOTBALL: не найдено %s", club["name"])
             except Exception as e:
                 logging.error("API-FOOTBALL %s: %s", club["name"], e)
         if teams:
@@ -313,7 +300,6 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
     for club in CLUBS:
         tid = teams.get(norm_key(club["name"]))
         if not tid:
-            logging.info("API-FOOTBALL: нет ID для %s", club["name"])
             continue
         try:
             r = api_get(f"{AF_BASE}/fixtures",
@@ -619,15 +605,39 @@ def send_telegram(text: str):
         except Exception as e:
             logging.error("Telegram error: %s", e)
 
-def format_msg(matches: list[dict]) -> str:
-    lines = [f"⚽ <b>2. Bundesliga: новые Testspiele ({len(matches)})</b>\n"]
-    for m in sorted(matches, key=lambda x: x["date"]):
-        t = f" {m['time']}" if m["time"] else ""
-        v = f"\n🏟 {html.escape(m['venue'])}" if m.get("venue") else ""
+def fmt_date(iso: str) -> str:
+    y, m, d = iso.split("-")
+    return f"{d}.{m}.{y}"
+
+def moved_from(con, h: str, home: str, away: str, d: str):
+    """Ищем ранее анонсированную дату той же пары команд (признак переноса)."""
+    row = con.execute(
+        "SELECT date FROM matches WHERE home=? AND away=? AND sent=1 AND hash!=? AND date!=? "
+        "ORDER BY rowid DESC LIMIT 1",
+        (home, away, h, d)).fetchone()
+    return row[0] if row else None
+
+def format_digest(rows, new_hashes, con) -> str:
+    today = date.today()
+    total = len(rows)
+    new_count = sum(1 for r in rows if r[0] in new_hashes)
+    today_count = sum(1 for r in rows if r[1] == today.isoformat())
+
+    head = f"⚽ <b>2. Bundesliga: Testspiele на {today.strftime('%d.%m.%Y')}</b>\n"
+    head += f"Всего предстоящих: {total} · новых: {new_count}"
+    if today_count:
+        head += f" · <b>сегодня: {today_count}</b>"
+    lines = [head, ""]
+
+    for h, d, t, home, away, venue, source, url in rows:
+        mark = "🆕" if h in new_hashes else "•"
+        old = moved_from(con, h, home, away, d)
+        moved = f" ♻️ было {fmt_date(old)}" if old else ""
+        tt = f" {t}" if t else ""
+        v = f" 🏟 {html.escape(venue)}" if venue else ""
         lines.append(
-            f"📅 <b>{m['date']}</b>{t}\n"
-            f"<b>{html.escape(m['home'])}</b> — <b>{html.escape(m['away'])}</b>{v}\n"
-            f"🔗 <a href=\"{html.escape(m['url'], quote=True)}\">{html.escape(m['source'])}</a>\n"
+            f"{mark} <b>{fmt_date(d)}</b>{tt} {html.escape(home)} — {html.escape(away)}{v}{moved}\n"
+            f"   🔗 <a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>"
         )
     return "\n".join(lines)
 
@@ -639,25 +649,33 @@ if __name__ == "__main__":
     matches = scrape_all()
     logging.info("Всего найдено: %d", len(matches))
 
-    new = []
+    new_hashes = set()
     for m in matches:
         row = con.execute("SELECT sent FROM matches WHERE hash=?", (m["hash"],)).fetchone()
         if not row:
             con.execute("INSERT INTO matches VALUES (?,?,?,?,?,?,?,?,0)",
                         (m["hash"], m["date"], m["time"], m["home"], m["away"],
                          m["venue"], m["source"], m["url"]))
-            new.append(m)
+            new_hashes.add(m["hash"])
         elif row[0] == 0:
-            new.append(m)
+            new_hashes.add(m["hash"])
     con.commit()
-
-    if new:
-        send_telegram(format_msg(new))
-        for m in new:
-            con.execute("UPDATE matches SET sent=1 WHERE hash=?", (m["hash"],))
+    if new_hashes:
+        for h in new_hashes:
+            con.execute("UPDATE matches SET sent=1 WHERE hash=?", (h,))
         con.commit()
-        logging.info("Отправлено в Telegram: %d", len(new))
+
+    # Ежедневный дайджест: ВЕСЬ список предстоящих + маркеры нового/перенесённого
+    today = date.today()
+    rows = con.execute(
+        "SELECT hash, date, time, home, away, venue, source, url FROM matches "
+        "WHERE date >= ? ORDER BY date, time",
+        (today.isoformat(),)).fetchall()
+    logging.info("Дайджест: предстоящих=%d, новых=%d", len(rows), len(new_hashes))
+
+    if rows:
+        send_telegram(format_digest(rows, new_hashes, con))
     else:
-        logging.info("Новых матчей нет (сообщение не отправляем)")
+        send_telegram("⚽ <b>2. Bundesliga Testspiele</b>\n\nПредстоящих матчей нет.")
 
     con.close()
