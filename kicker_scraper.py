@@ -150,11 +150,21 @@ def web_search(query: str) -> list[dict]:
         logging.error("SEARCH: DDG error %s", e)
         return []
 
-# ---------- Источник 1: weltfussball.de ----------
+# ---------- Источник 1: weltfussball.de (с фильтром HTML) ----------
 LABEL_RE = re.compile(
     r"Fu[ßs]ball\s+Freundschaft\s+Vereine\s+Kalenderwoche\s+([^<\"\n]+?)\s+-\s+([^<\"\n]+?)\s+am\s+"
     r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}:\d{2})"
 )
+
+def is_valid_team_name(name: str) -> bool:
+    """Проверяет, что имя команды не содержит HTML и не слишком длинное."""
+    if len(name) > 80:
+        return False
+    if any(tag in name for tag in ["<", ">", "div", "class=", "href=", "data-"]):
+        return False
+    if name.count(" ") > 6:  # слишком много слов
+        return False
+    return True
 
 def scrape_club(club: dict, today: date) -> list[dict]:
     url = schedule_url(club)
@@ -164,6 +174,12 @@ def scrape_club(club: dict, today: date) -> list[dict]:
     for m in LABEL_RE.finditer(r.text):
         home = expand_club(m.group(1))
         away = expand_club(m.group(2))
+        
+        # Фильтр HTML-мусора
+        if not is_valid_team_name(home) or not is_valid_team_name(away):
+            logging.info("WF skip (HTML мусор): %s vs %s", home[:50], away[:50])
+            continue
+        
         d = date(int(m.group(5)), int(m.group(4)), int(m.group(3)))
         if d < today or d > END_DATE:
             continue
@@ -623,21 +639,32 @@ def format_digest(rows, new_hashes, con) -> str:
     new_count = sum(1 for r in rows if r[0] in new_hashes)
     today_count = sum(1 for r in rows if r[1] == today.isoformat())
 
-    head = f"⚽ <b>2. Bundesliga: Testspiele на {today.strftime('%d.%m.%Y')}</b>\n"
-    head += f"Всего предстоящих: {total} · новых: {new_count}"
+    head = f"⚽ <b>2. Bundesliga Testspiele</b>\n"
+    head += f"📅 {today.strftime('%d.%m.%Y')} · всего {total}"
+    if new_count:
+        head += f" · 🆕 {new_count}"
     if today_count:
-        head += f" · <b>сегодня: {today_count}</b>"
+        head += f" · <b>сегодня {today_count}</b>"
     lines = [head, ""]
 
+    last_date = None
     for h, d, t, home, away, venue, source, url in rows:
-        mark = "🆕" if h in new_hashes else "•"
+        # Группировка по датам
+        if d != last_date:
+            if last_date:
+                lines.append("")
+            lines.append(f"▫️ <b>{fmt_date(d)}</b>")
+            last_date = d
+        
+        mark = "🆕 " if h in new_hashes else ""
         old = moved_from(con, h, home, away, d)
-        moved = f" ♻️ было {fmt_date(old)}" if old else ""
+        moved = f" <i>(было {fmt_date(old)})</i>" if old else ""
         tt = f" {t}" if t else ""
         v = f" 🏟 {html.escape(venue)}" if venue else ""
+        
         lines.append(
-            f"{mark} <b>{fmt_date(d)}</b>{tt} {html.escape(home)} — {html.escape(away)}{v}{moved}\n"
-            f"   🔗 <a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>"
+            f"{mark}{tt} <b>{html.escape(home)}</b> — <b>{html.escape(away)}</b>{v}{moved} · "
+            f"<a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>"
         )
     return "\n".join(lines)
 
@@ -665,7 +692,7 @@ if __name__ == "__main__":
             con.execute("UPDATE matches SET sent=1 WHERE hash=?", (h,))
         con.commit()
 
-    # Ежедневный дайджест: ВЕСЬ список предстоящих + маркеры нового/перенесённого
+    # Ежедневный дайджест
     today = date.today()
     rows = con.execute(
         "SELECT hash, date, time, home, away, venue, source, url FROM matches "
