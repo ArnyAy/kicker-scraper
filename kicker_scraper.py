@@ -50,6 +50,28 @@ def match_hash(m: dict) -> str:
 def involves_our_club(home: str, away: str) -> bool:
     return norm_key(home) in OUR_KEYS or norm_key(away) in OUR_KEYS
 
+def is_valid_team_name(name: str) -> bool:
+    if not name or len(name) > 60:
+        return False
+    if any(tag in name for tag in ["<", ">", "div", "class=", "href=", "data-", '="']):
+        return False
+    if name.count(" ") > 6:
+        return False
+    if re.search(r"\d{2}\.\d{2}\.\d{4}", name):  # хвост "am 29.09.2026"
+        return False
+    return True
+
+def purge_invalid(con):
+    """Удаляет из БД мусорные записи, созданные до введения фильтра."""
+    rows = con.execute("SELECT hash, home, away FROM matches").fetchall()
+    bad = [h for h, home, away in rows
+           if not (is_valid_team_name(home) and is_valid_team_name(away))]
+    for h in bad:
+        con.execute("DELETE FROM matches WHERE hash=?", (h,))
+    if bad:
+        con.commit()
+        logging.info("PURGE: удалено мусорных записей: %d", len(bad))
+
 def url_relevant(url: str, home: str, away: str) -> bool:
     if not url.startswith("http"):
         return False
@@ -150,21 +172,11 @@ def web_search(query: str) -> list[dict]:
         logging.error("SEARCH: DDG error %s", e)
         return []
 
-# ---------- Источник 1: weltfussball.de (с фильтром HTML) ----------
+# ---------- Источник 1: weltfussball.de ----------
 LABEL_RE = re.compile(
     r"Fu[ßs]ball\s+Freundschaft\s+Vereine\s+Kalenderwoche\s+([^<\"\n]+?)\s+-\s+([^<\"\n]+?)\s+am\s+"
     r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}:\d{2})"
 )
-
-def is_valid_team_name(name: str) -> bool:
-    """Проверяет, что имя команды не содержит HTML и не слишком длинное."""
-    if len(name) > 80:
-        return False
-    if any(tag in name for tag in ["<", ">", "div", "class=", "href=", "data-"]):
-        return False
-    if name.count(" ") > 6:  # слишком много слов
-        return False
-    return True
 
 def scrape_club(club: dict, today: date) -> list[dict]:
     url = schedule_url(club)
@@ -174,12 +186,9 @@ def scrape_club(club: dict, today: date) -> list[dict]:
     for m in LABEL_RE.finditer(r.text):
         home = expand_club(m.group(1))
         away = expand_club(m.group(2))
-        
-        # Фильтр HTML-мусора
         if not is_valid_team_name(home) or not is_valid_team_name(away):
-            logging.info("WF skip (HTML мусор): %s vs %s", home[:50], away[:50])
+            logging.info("WF skip (мусор): %s | %s", home[:40], away[:40])
             continue
-        
         d = date(int(m.group(5)), int(m.group(4)), int(m.group(3)))
         if d < today or d > END_DATE:
             continue
@@ -239,6 +248,8 @@ def scrape_kicker(club_name: str, today: date) -> list[dict]:
         if len(toks) < 4:
             continue
         home, away = expand_club(toks[1]), expand_club(toks[-2])
+        if not is_valid_team_name(home) or not is_valid_team_name(away):
+            continue
         if not is_first_team_friendly(home, away):
             continue
         tm = re.search(r"\b\d{1,2}:\d{2}\b", txt)
@@ -343,6 +354,8 @@ def scrape_apifootball(today: date, cache: dict) -> list[dict]:
                 ta = (f.get("teams") or {}).get("away") or {}
                 home = expand_club(th.get("name", ""))
                 away = expand_club(ta.get("name", ""))
+                if not is_valid_team_name(home) or not is_valid_team_name(away):
+                    continue
                 if not is_first_team_friendly(home, away):
                     continue
                 if not involves_our_club(home, away):
@@ -519,6 +532,8 @@ def validate_llm_rows(rows: list, source: str) -> list[dict]:
             continue
         home = expand_club(row.get("home", ""))
         away = expand_club(row.get("away", ""))
+        if not is_valid_team_name(home) or not is_valid_team_name(away):
+            continue
         if not involves_our_club(home, away):
             continue
         if not is_first_team_friendly(home, away):
@@ -603,21 +618,35 @@ def scrape_all() -> list[dict]:
         logging.info("  %s %s  %s vs %s  [%s]", m["date"], m["time"], m["home"], m["away"], m["source"])
     return out
 
-# ---------- Telegram ----------
+# ---------- Telegram (резка ТОЛЬКО по границам строк) ----------
 def send_telegram(text: str):
     token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         logging.error("No TELEGRAM_TOKEN/CHAT_ID")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for i in range(0, len(text), 4000):
-        chunk = text[i:i + 4000]
+
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(line) > 3900:          # страховка: одна строка не влезает
+            line = line[:3900]
+        if cur and len(cur) + len(line) + 1 > 4000:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+
+    for chunk in chunks:
         try:
             r = requests.post(url, json={
                 "chat_id": chat, "text": chunk,
                 "parse_mode": "HTML", "disable_web_page_preview": True
             }, timeout=15)
-            logging.info("Telegram: HTTP %s", r.status_code)
+            if r.status_code == 200:
+                logging.info("Telegram: HTTP 200")
+            else:
+                logging.error("Telegram HTTP %s: %s", r.status_code, r.text[:300])
         except Exception as e:
             logging.error("Telegram error: %s", e)
 
@@ -626,7 +655,6 @@ def fmt_date(iso: str) -> str:
     return f"{d}.{m}.{y}"
 
 def moved_from(con, h: str, home: str, away: str, d: str):
-    """Ищем ранее анонсированную дату той же пары команд (признак переноса)."""
     row = con.execute(
         "SELECT date FROM matches WHERE home=? AND away=? AND sent=1 AND hash!=? AND date!=? "
         "ORDER BY rowid DESC LIMIT 1",
@@ -649,21 +677,20 @@ def format_digest(rows, new_hashes, con) -> str:
 
     last_date = None
     for h, d, t, home, away, venue, source, url in rows:
-        # Группировка по датам
         if d != last_date:
             if last_date:
                 lines.append("")
             lines.append(f"▫️ <b>{fmt_date(d)}</b>")
             last_date = d
-        
+
         mark = "🆕 " if h in new_hashes else ""
         old = moved_from(con, h, home, away, d)
         moved = f" <i>(было {fmt_date(old)})</i>" if old else ""
-        tt = f" {t}" if t else ""
+        tt = f"{t} " if t else ""
         v = f" 🏟 {html.escape(venue)}" if venue else ""
-        
+
         lines.append(
-            f"{mark}{tt} <b>{html.escape(home)}</b> — <b>{html.escape(away)}</b>{v}{moved} · "
+            f"{mark}{tt}<b>{html.escape(home)}</b> — <b>{html.escape(away)}</b>{v}{moved} · "
             f"<a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>"
         )
     return "\n".join(lines)
@@ -671,6 +698,7 @@ def format_digest(rows, new_hashes, con) -> str:
 # ---------- Main ----------
 if __name__ == "__main__":
     con = init_db()
+    purge_invalid(con)   # чистим старый мусор из БД
 
     logging.info("Парсинг: api-football + weltfussball + kicker + Gemini + LLM2...")
     matches = scrape_all()
@@ -692,7 +720,6 @@ if __name__ == "__main__":
             con.execute("UPDATE matches SET sent=1 WHERE hash=?", (h,))
         con.commit()
 
-    # Ежедневный дайджест
     today = date.today()
     rows = con.execute(
         "SELECT hash, date, time, home, away, venue, source, url FROM matches "
